@@ -1,0 +1,6 @@
+[plugin]
+name = "lineup"
+version = "0.1.0"
+capability = "lineup"
+requires = ["redix"]
+optional_requires = []
