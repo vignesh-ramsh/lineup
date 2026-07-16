@@ -136,6 +136,41 @@ def _run_swallowing_shutdown_noise(coro: "asyncio.coroutines.Coroutine") -> None
         logger.debug(f"shutdown-time noise (harmless): {exc!r}")
 
 
+async def _resilient_listen(broker, queue_name: str, shutdown_event: asyncio.Event) -> None:
+    """Keeps a queue's Receiver listening indefinitely, surviving a
+    transient failure instead of exiting — a worker sitting idle with
+    nothing queued is the NORMAL case, not an error condition.
+
+    The concrete failure this exists for: redis-py defaults every
+    connection's `socket_timeout` to 5 SECONDS — a client-side read
+    timeout, independent of BRPOP's own protocol-level "block forever"
+    semantics. With nothing pushed to the queue for 5 idle seconds, the
+    underlying socket read times out and raises a real
+    `redis.exceptions.TimeoutError`, which `taskiq_redis.ListQueueBroker.
+    listen()`'s own `except ConnectionError: continue` does NOT catch
+    (`TimeoutError` doesn't subclass `ConnectionError`) — it propagates
+    straight out of `Receiver.listen()`. Verified directly: a worker on
+    an empty queue raised exactly this, exactly 5 seconds after starting,
+    with no Ctrl-C involved at all.
+
+    A fresh `Receiver` is constructed on every retry rather than reusing
+    one across failures — cheap, and avoids any doubt about whether the
+    previous attempt left `Receiver`'s own internal state (its prefetch
+    semaphore, in-flight message queue) in a consistent place to resume
+    from after being torn down mid-flight."""
+    while not shutdown_event.is_set():
+        receiver = Receiver(broker=broker)
+        try:
+            await receiver.listen(shutdown_event)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            if shutdown_event.is_set():
+                return
+            logger.debug(f"lineup worker: '{queue_name}' listener hiccup ({exc!r}), reconnecting...")
+            await asyncio.sleep(1)
+
+
 def _resolve_queues(requested: str | None) -> list[str]:
     """No `--queues`: every queue something has already declared (a
     `@arc.relay.task(queue=...)` somewhere). An explicit `--queues=...`
@@ -206,17 +241,27 @@ def worker(
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, shutdown_event.set)
 
-        receivers = [Receiver(broker=brokers[name]) for name in target]
-
         try:
-            await asyncio.gather(*(r.listen(shutdown_event) for r in receivers))
+            await asyncio.gather(*(_resilient_listen(brokers[name], name, shutdown_event) for name in target))
         finally:
             console.print("[dim]lineup worker shutting down...[/dim]")
             for name in target:
                 await brokers[name].shutdown()
             await _close_all_capabilities(exclude=frozenset({"lineup"}))
 
-    _run_swallowing_shutdown_noise(_main())
+    # No blanket "swallow any exception" wrapper here on purpose (unlike
+    # scheduler below) — _resilient_listen already makes the one correct
+    # decision at its source (retry if shutdown wasn't requested, return
+    # cleanly if it was), so anything that still escapes past it is a
+    # genuine, unanticipated bug that should surface loudly, not get
+    # hidden behind a debug-level log line the way a real one did before
+    # this fix (the exact 5-second-idle-timeout issue this whole change
+    # addresses). KeyboardInterrupt is still handled here as a plain
+    # fallback for platforms where add_signal_handler isn't supported
+    # (contextlib.suppress(NotImplementedError) above) and a bare Ctrl-C
+    # raises it directly instead of going through shutdown_event at all.
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(_main())
 
 
 @app.command()
