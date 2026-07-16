@@ -87,7 +87,10 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import pycron
+from taskiq import Context, TaskiqDepends
 from taskiq_redis import ListQueueBroker
+
+import arc
 
 CAPABILITY = "lineup"
 DEFAULT_QUEUE = "default"
@@ -156,6 +159,21 @@ class LineupProvider:
 
     def broker_map(self) -> dict[str, ListQueueBroker]:
         return dict(self._brokers)
+
+    def scheduled_tasks(self) -> list[dict]:
+        """Every task currently carrying a cron schedule, across every
+        queue — the exact same live config `arc lineup scheduler`'s own
+        `LabelScheduleSource` reads from (§3.15), surfaced here purely for
+        introspection (admin's Scheduled Jobs listing). No persistence —
+        this is "what's configured right now," not history; `_job_log`
+        (relay's own table) is where history lives."""
+        out: list[dict] = []
+        for queue, broker in self._brokers.items():
+            for name, task in broker.get_all_tasks().items():
+                for sched in task.labels.get("schedule", []):
+                    if "cron" in sched:
+                        out.append({"task_name": name, "queue": queue, "cron": sched["cron"]})
+        return out
 
     # ------------------------------------------------------------------ #
     # Task registration — internal power-source surface, not the intended
@@ -230,12 +248,84 @@ class LineupProvider:
                 # which fires it at its real next occurrence, never before.
                 labels["schedule"] = [{"cron": cron}]
 
+            # `context: Context = TaskiqDepends()` is TaskIQ's own DI
+            # mechanism (the same one FastAPI's Depends() is modeled on) —
+            # deliberately NOT wrapped with functools.wraps(fn), since that
+            # would copy fn's own __annotations__ onto this wrapper and
+            # silently erase the `context` parameter TaskIQ needs to see to
+            # inject it at all. `context.message.labels` is the ONLY place
+            # that reveals whether THIS SPECIFIC invocation came from `arc
+            # lineup scheduler` (which stamps a `schedule_id` label on
+            # every kick, verified directly: a plain .kiq() call carries no
+            # such label, an AsyncKicker(...).with_labels(schedule_id=...)
+            # kick — exactly what TaskiqScheduler.on_ready does — does) or
+            # from a normal enqueue() — the task's own STATIC `schedule`
+            # label only says "this task CAN be scheduled," not "this run
+            # WAS."
+            async def wrapped(*args: Any, context: Context = TaskiqDepends(), **kwargs: Any) -> Any:
+                started_at = datetime.now(timezone.utc)
+                job_type = "Scheduler" if context.message.labels.get("schedule_id") else "Task"
+                status, error = "success", None
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as exc:
+                    status, error = "failed", f"{type(exc).__name__}: {exc}"
+                    raise
+                finally:
+                    await self._write_job_log(
+                        task_name=task_name,
+                        queue=queue,
+                        job_type=job_type,
+                        queued_by=plugin,
+                        status=status,
+                        error=error,
+                        started_at=started_at,
+                        finished_at=datetime.now(timezone.utc),
+                    )
+
             broker = self._broker_for(queue)
-            decorated = broker.task(task_name=task_name, **labels)(fn)
+            decorated = broker.task(task_name=task_name, **labels)(wrapped)
             self._tasks[task_name] = decorated
             return decorated
 
         return decorator
+
+    async def _write_job_log(
+        self,
+        *,
+        task_name: str,
+        queue: str,
+        job_type: str,
+        queued_by: str | None,
+        status: str,
+        error: str | None,
+        started_at: datetime,
+        finished_at: datetime,
+    ) -> None:
+        """`_job_log` is owned by `relay` (docs/arc.MD §3.11/§3.15) — lineup
+        just inserts into it, the same way any plugin can insert into a
+        table it doesn't own without needing to own its schema (ownership
+        only matters for migration/diffing, §3.9). Best-effort: a DB
+        hiccup writing the log row must never mask the real task's own
+        outcome, which has already been decided by the time this runs."""
+        try:
+            await arc.psqldb.insert(
+                "_job_log",
+                {
+                    "task_name": task_name,
+                    "queue": queue,
+                    "executor": "lineup",
+                    "job_type": job_type,
+                    "queued_by": queued_by,
+                    "status": status,
+                    "error": error,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "duration_ms": int((finished_at - started_at).total_seconds() * 1000),
+                },
+            )
+        except Exception as exc:
+            logger.error(f"failed to write _job_log row for {task_name}: {exc}")
 
     def tasks(self) -> dict[str, Any]:
         """Every registered task, keyed by its `{plugin}.{fn.__name__}`
@@ -339,14 +429,40 @@ class LineupProvider:
         broker for `queue` — see the long comment on `_broker_for` above
         for why this can't be deferred until an actual enqueue_by_path()
         call (a worker process needs it registered too, and never calls
-        enqueue_by_path() itself)."""
+        enqueue_by_path() itself).
+
+        `job_type` is always "Task" here, never "Scheduler", by
+        construction — this task never declares a `schedule` label of its
+        own (unlike `task()`'s wrapper above), so `arc lineup scheduler`'s
+        `LabelScheduleSource` can never pick it up in the first place; no
+        need to inspect a Context to tell the two apart the way `task()`'s
+        wrapper does."""
 
         async def _dispatch(module_path: str, qualname: str, args: list, kwargs: dict) -> None:
-            module = importlib.import_module(module_path)
-            target: Any = module
-            for part in qualname.split("."):
-                target = getattr(target, part)
-            await target(*args, **kwargs)
+            started_at = datetime.now(timezone.utc)
+            task_name = f"{module_path}.{qualname}"
+            queued_by = module_path.split(".")[0] if module_path else None
+            status, error = "success", None
+            try:
+                module = importlib.import_module(module_path)
+                target: Any = module
+                for part in qualname.split("."):
+                    target = getattr(target, part)
+                await target(*args, **kwargs)
+            except Exception as exc:
+                status, error = "failed", f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                await self._write_job_log(
+                    task_name=task_name,
+                    queue=queue,
+                    job_type="Task",
+                    queued_by=queued_by,
+                    status=status,
+                    error=error,
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc),
+                )
 
         self._dispatch_tasks[queue] = broker.task(task_name=f"lineup._dispatch.{queue}")(_dispatch)
 
@@ -389,4 +505,10 @@ class LineupProvider:
 def register(kernel: Any) -> None:
     redix = kernel.get("redix")
     provider = LineupProvider(kernel, redis_url=redix.url)
-    kernel.export(CAPABILITY, provider, requires=["redix"], optional_requires=[])
+    # psqldb: needed to write into relay's own `_job_log` table (§3.11/
+    # §3.15) whenever a task actually runs — not for durable dispatch
+    # itself, which only ever needs redix. Declared as a hard requirement
+    # (not best-effort/optional) so a project missing it gets a clear
+    # boot-time error instead of every task's log write silently failing
+    # forever.
+    kernel.export(CAPABILITY, provider, requires=["redix", "psqldb"], optional_requires=[])
