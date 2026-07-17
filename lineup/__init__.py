@@ -82,7 +82,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -91,6 +91,34 @@ from taskiq import Context, TaskiqDepends
 from taskiq_redis import ListQueueBroker
 
 import arc
+
+
+def _local_cron_offset() -> str | timedelta:
+    """TaskIQ's scheduler evaluates every cron expression against UTC by
+    default (`taskiq.cli.scheduler.run.is_cron_task_now` builds `now =
+    datetime.now(tz=timezone.utc)` and passes it straight to
+    `pycron.is_now()` unless a `cron_offset` label says otherwise) — but
+    every cron string declared through `task()` below is documented and
+    intended to fire at the SERVER's own local wall-clock time (docs/
+    arc.MD §3.15's own worked example: cron "15 18 * * *" annotated
+    "local system time IST"), not UTC. Without this, a task registered
+    with that cron would actually fire at 18:15 UTC (23:45 IST) instead.
+
+    Resolved from /etc/localtime's own symlink target (e.g. .../zoneinfo/
+    Asia/Kolkata -> "Asia/Kolkata") so this tracks whatever zone the
+    server is actually configured with, rather than hardcoding one — a
+    fixed UTC-offset timedelta (still correct for matching cron fields,
+    just not DST-aware) is the fallback if that symlink is missing or
+    doesn't resolve under a zoneinfo directory (e.g. non-Linux hosts)."""
+    try:
+        target = str(Path("/etc/localtime").resolve())
+        marker = "zoneinfo/"
+        idx = target.find(marker)
+        if idx != -1:
+            return target[idx + len(marker) :]
+    except OSError:
+        pass
+    return datetime.now().astimezone().utcoffset() or timedelta(0)
 
 CAPABILITY = "lineup"
 DEFAULT_QUEUE = "default"
@@ -246,7 +274,7 @@ class LineupProvider:
                 # the broker's queue in any way — it only becomes visible
                 # to arc.lineup.run_scheduler()'s LabelScheduleSource,
                 # which fires it at its real next occurrence, never before.
-                labels["schedule"] = [{"cron": cron}]
+                labels["schedule"] = [{"cron": cron, "cron_offset": _local_cron_offset()}]
 
             # `context: Context = TaskiqDepends()` is TaskIQ's own DI
             # mechanism (the same one FastAPI's Depends() is modeled on) —
