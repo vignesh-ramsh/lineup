@@ -109,6 +109,21 @@ def _boot() -> None:
     # configured root logger to actually be visible on the console, unlike
     # a short-lived request handler where nobody's watching stdout live.
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(name)s: %(message)s")
+    # taskiq.receiver.receiver logs its own startup banners ("Setting
+    # unlimited number of async tasks...", "Listening started.", "Stopping
+    # prefetching messages...", "The runner is stopped.") every time a
+    # Receiver is constructed — including every retry _resilient_listen
+    # does on the known, already-handled 5-second idle BRPOP timeout
+    # (redis-py's default socket_timeout is shorter than BRPOP's own
+    # block-forever semantics). That retry is harmless — the worker keeps
+    # running — but on an idle queue it repeats every ~6 seconds, and each
+    # retry constructs a FRESH Receiver that re-logs all four lines,
+    # flooding the console. Raised to ERROR (WARNING isn't enough — the
+    # "unlimited async tasks" line is itself a WARNING) specifically on
+    # this one logger, not the whole "taskiq" namespace: taskiq.redis_broker
+    # logs genuinely useful "Redis connection error" warnings on a REAL
+    # connectivity problem, and those must stay visible.
+    logging.getLogger("taskiq.receiver.receiver").setLevel(logging.ERROR)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", arc.ArcAdvisory)
         arc.boot()
