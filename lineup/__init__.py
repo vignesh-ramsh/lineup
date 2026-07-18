@@ -142,6 +142,14 @@ class LineupProvider:
         self._tasks: dict[str, Any] = {}
         self._dispatch_tasks: dict[str, Any] = {}
         self._loading_plugin: str | None = None
+        # Lifecycle: open() starts every broker that exists at that moment,
+        # but brokers are created LAZILY (_broker_for) — an ad hoc enqueue
+        # to a brand-new queue name after startup creates one that open()
+        # never saw. _opened/_started let enqueue_by_path() start such a
+        # broker on first use instead of silently relying on taskiq-redis
+        # happening to lazy-init its own pool.
+        self._opened = False
+        self._started: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Broker access — one ListQueueBroker per distinct queue name, created
@@ -451,6 +459,24 @@ class LineupProvider:
             )
         return module_path, qualname
 
+    def _dispatch_module_allowed(self, module_path: str) -> bool:
+        """The generic dispatch task imports-and-calls whatever
+        (module, qualname) arrives in a Redis message — without a check,
+        anyone with write access to Redis gets arbitrary code execution in
+        the worker (e.g. `("os", "system", ["..."], {})`). This bounds it
+        to code that belongs to this project: a module whose root is an
+        installed plugin's own package (flat layout: package name == plugin
+        name, §3.7), or one of the synthetic module names relay/lineup's
+        own directory loaders register (api/hooks/tasks files). Checked on
+        the WORKER side, where it matters — check_resolvable() on the
+        enqueue side is a convenience check, not a security boundary."""
+        root = module_path.split(".")[0]
+        if root.startswith("_arc_relay_") or root.startswith("_arc_lineup_"):
+            return True
+        caps = self._kernel.capabilities()
+        plugin_names = {cap.plugin for cap in caps.values()}
+        return root in plugin_names or root in caps
+
     def _register_dispatch_task(self, broker: ListQueueBroker, queue: str) -> None:
         """The generic task that actually does the dynamic import + call,
         registered unconditionally the moment `_broker_for` creates a
@@ -472,6 +498,12 @@ class LineupProvider:
             queued_by = module_path.split(".")[0] if module_path else None
             status, error = "success", None
             try:
+                if not self._dispatch_module_allowed(module_path):
+                    raise PermissionError(
+                        f"refusing to dispatch '{module_path}.{qualname}' — its root module is not "
+                        f"an installed ARC plugin package (or a relay/lineup-loaded module). "
+                        f"lineup only executes code belonging to this project's own plugins."
+                    )
                 module = importlib.import_module(module_path)
                 target: Any = module
                 for part in qualname.split("."):
@@ -506,6 +538,7 @@ class LineupProvider:
         process minutes or hours later."""
         module_path, qualname = self.check_resolvable(fn)
         self._broker_for(queue)  # ensures the dispatch task below actually exists
+        await self._ensure_started(queue)  # a queue first touched after open() still gets a real startup()
         dispatch = self._dispatch_tasks[queue]
         await dispatch.kiq(module_path, qualname, list(args), kwargs)
 
@@ -519,12 +552,25 @@ class LineupProvider:
     # already does for psqldb/redix.
     # ------------------------------------------------------------------ #
     async def open(self) -> None:
-        for broker in self._brokers.values():
-            await broker.startup()
+        self._opened = True
+        for name, broker in self._brokers.items():
+            if name not in self._started:
+                await broker.startup()
+                self._started.add(name)
+
+    async def _ensure_started(self, queue: str) -> None:
+        """Start a lazily-created broker if the provider is already open —
+        see __init__'s lifecycle comment."""
+        if self._opened and queue not in self._started:
+            await self._brokers[queue].startup()
+            self._started.add(queue)
 
     async def close(self) -> None:
-        for broker in self._brokers.values():
-            await broker.shutdown()
+        for name, broker in self._brokers.items():
+            if name in self._started:
+                await broker.shutdown()
+        self._started.clear()
+        self._opened = False
 
     async def health(self) -> dict:
         return {"ok": True, "queues": self.queues()}

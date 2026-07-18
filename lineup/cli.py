@@ -234,6 +234,10 @@ def worker(
             brokers[name].is_worker_process = True
             await brokers[name].startup()
         await _open_all_capabilities(exclude=frozenset({"lineup"}))
+        # Long-running ARC process: join the process registry + reload
+        # bridge (SIGUSR1 / reload-stamp poll -> local system.reload), same
+        # as every gateway worker does in its own lifespan startup.
+        arc.events.install_process_bridge(role="lineup-worker")
 
         shutdown_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -245,6 +249,7 @@ def worker(
             await asyncio.gather(*(_resilient_listen(brokers[name], name, shutdown_event) for name in target))
         finally:
             console.print("[dim]lineup worker shutting down...[/dim]")
+            await arc.events.uninstall_process_bridge()
             for name in target:
                 await brokers[name].shutdown()
             await _close_all_capabilities(exclude=frozenset({"lineup"}))
@@ -296,6 +301,7 @@ def scheduler(
             await sched.startup()
             loops.append(SchedulerLoop(sched))
         await _open_all_capabilities(exclude=frozenset({"lineup"}))
+        arc.events.install_process_bridge(role="lineup-scheduler")
 
         run_task = asyncio.ensure_future(asyncio.gather(*(loop.run() for loop in loops)))
         loop = asyncio.get_running_loop()
@@ -309,6 +315,7 @@ def scheduler(
             pass
         finally:
             console.print("[dim]lineup scheduler shutting down...[/dim]")
+            await arc.events.uninstall_process_bridge()
             for name in target:
                 await brokers[name].shutdown()
             await _close_all_capabilities(exclude=frozenset({"lineup"}))
