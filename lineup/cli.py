@@ -108,7 +108,11 @@ def _boot() -> None:
     # (e.g. example_hr/tasks/onboarding.py's logger.info calls) needs a
     # configured root logger to actually be visible on the console, unlike
     # a short-lived request handler where nobody's watching stdout live.
-    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(name)s: %(message)s")
+    # arc.boot() (below) now owns this via arc.log (§3.10) — a bare
+    # logging.basicConfig() call here used to do it directly, but would
+    # now be a silent no-op every second time regardless (stdlib's
+    # basicConfig only ever attaches handlers once per process) and,
+    # worse, would race arc.log's own root-handler setup if it ran first.
     # taskiq.receiver.receiver logs its own startup banners ("Setting
     # unlimited number of async tasks...", "Listening started.", "Stopping
     # prefetching messages...", "The runner is stopped.") every time a
@@ -253,6 +257,7 @@ def worker(
         # bridge (SIGUSR1 / reload-stamp poll -> local system.reload), same
         # as every gateway worker does in its own lifespan startup.
         arc.events.install_process_bridge(role="lineup-worker")
+        arc.log.set_role("lineup-worker")
 
         shutdown_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -317,6 +322,7 @@ def scheduler(
             loops.append(SchedulerLoop(sched))
         await _open_all_capabilities(exclude=frozenset({"lineup"}))
         arc.events.install_process_bridge(role="lineup-scheduler")
+        arc.log.set_role("lineup-scheduler")
 
         run_task = asyncio.ensure_future(asyncio.gather(*(loop.run() for loop in loops)))
         loop = asyncio.get_running_loop()
