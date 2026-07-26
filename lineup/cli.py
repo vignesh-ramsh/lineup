@@ -52,12 +52,16 @@ def _url_from_disk() -> str:
     only for `status`, which deliberately doesn't need a full arc.boot()."""
     root = find_project_root()
     if root is None:
-        err_console.print("Not inside an ARC project (no .arc/arc.toml found here or in any parent).")
+        err_console.print(
+            "Not inside an ARC project (no .arc/arc.toml found here or in any parent)."
+        )
         raise typer.Exit(code=1)
     mgr = SettingsManager(root / ".arc")
     url = mgr.get(URL_KEY, reveal=True)
     if url is None:
-        err_console.print(f"'{URL_KEY}' is not set. Run: arc settings set {URL_KEY} redis://host:6379/0 --secret")
+        err_console.print(
+            f"'{URL_KEY}' is not set. Run: arc settings set {URL_KEY} redis://host:6379/0 --secret"
+        )
         raise typer.Exit(code=1)
     return url
 
@@ -186,7 +190,9 @@ async def _resilient_listen(broker, queue_name: str, shutdown_event: asyncio.Eve
         except BaseException as exc:
             if shutdown_event.is_set():
                 return
-            logger.debug(f"lineup worker: '{queue_name}' listener hiccup ({exc!r}), reconnecting...")
+            logger.debug(
+                f"lineup worker: '{queue_name}' listener hiccup ({exc!r}), reconnecting..."
+            )
             await asyncio.sleep(1)
 
 
@@ -222,18 +228,24 @@ def status() -> None:
         client.ping()
         elapsed = time.monotonic() - start
     except Exception as exc:
-        err_console.print(f"lineup: FAILED to connect to {parsed.hostname}:{parsed.port or 6379} — {exc}")
+        err_console.print(
+            f"lineup: FAILED to connect to {parsed.hostname}:{parsed.port or 6379} — {exc}"
+        )
         raise typer.Exit(code=1)
     finally:
         client.close()
-    console.print(f"[bold green]lineup: OK[/bold green] ({elapsed * 1000:.0f}ms) via redix's redis_url")
+    console.print(
+        f"[bold green]lineup: OK[/bold green] ({elapsed * 1000:.0f}ms) via redix's redis_url"
+    )
     console.print("  run `arc lineup worker` / `arc lineup scheduler` to see registered queues.")
 
 
 @app.command()
 def worker(
     queues: str | None = typer.Option(
-        None, "--queues", help="Comma-separated queue names to consume. Default: every registered queue."
+        None,
+        "--queues",
+        help="Comma-separated queue names to consume. Default: every registered queue.",
     ),
 ) -> None:
     """Consume durable jobs from one or more named queues in this one
@@ -266,7 +278,9 @@ def worker(
                 loop.add_signal_handler(sig, shutdown_event.set)
 
         try:
-            await asyncio.gather(*(_resilient_listen(brokers[name], name, shutdown_event) for name in target))
+            await asyncio.gather(
+                *(_resilient_listen(brokers[name], name, shutdown_event) for name in target)
+            )
         finally:
             console.print("[dim]lineup worker shutting down...[/dim]")
             await arc.events.uninstall_process_bridge()
@@ -289,10 +303,31 @@ def worker(
         asyncio.run(_main())
 
 
+# Held by exactly one scheduler process per queue-set for as long as it's
+# the active dispatcher (redix.lock()'s own background renewal, see
+# redix/redix/__init__.py, keeps it alive across the whole process
+# lifetime — not just one poll). 15s: generous enough that one missed
+# renewal (a GC pause, a transient Redis blip) doesn't cost leadership
+# outright, short enough that a genuinely crashed leader's replicas take
+# over within seconds, not minutes.
+_LEADER_LOCK_TIMEOUT_SECONDS = 15.0
+
+
+def _leader_lock_name(target: list[str]) -> str:
+    """Scoped to the resolved queue set, not global — two scheduler
+    processes each polling a DIFFERENT, non-overlapping `--queues` subset
+    are legitimately independent and must not serialize behind one
+    process-wide lock; two processes polling the SAME set are exactly the
+    double-fire risk this exists to prevent."""
+    return f"lineup:scheduler:leader:{','.join(sorted(target))}"
+
+
 @app.command()
 def scheduler(
     queues: str | None = typer.Option(
-        None, "--queues", help="Comma-separated queue names to poll for scheduled jobs. Default: every registered queue."
+        None,
+        "--queues",
+        help="Comma-separated queue names to poll for scheduled jobs. Default: every registered queue.",
     ),
 ) -> None:
     """Poll every registered queue's cron-labeled tasks and dispatch each
@@ -300,7 +335,15 @@ def scheduler(
     registration time (see lineup/__init__.py's module docstring for why
     this is guaranteed, not just intended: TaskIQ's own is_cron_task_now
     checks the real wall-clock minute against the cron expression on every
-    poll, it never treats "just discovered this schedule" as "due")."""
+    poll, it never treats "just discovered this schedule" as "due").
+
+    Safe to run more than one of these against the same queues: only the
+    one holding redix's leader-election lock actually dispatches, and a
+    standby takes over automatically if the leader dies (via redix.lock()'s
+    own renewal + TTL, docs on _LEADER_LOCK_TIMEOUT_SECONDS above). Without
+    redix installed at all, there's no way to coordinate — this still runs,
+    but unprotected, and running more than one becomes the caller's own
+    responsibility to avoid."""
     _boot()
 
     async def _main() -> None:
@@ -324,7 +367,32 @@ def scheduler(
         arc.events.install_process_bridge(role="lineup-scheduler")
         arc.log.set_role("lineup-scheduler")
 
-        run_task = asyncio.ensure_future(asyncio.gather(*(loop.run() for loop in loops)))
+        async def _dispatch_as_leader() -> None:
+            if not hasattr(arc, "redix"):
+                console.print(
+                    "[yellow]lineup scheduler: redix is not installed — running WITHOUT "
+                    "leader election. Do not run more than one scheduler process against "
+                    "the same queues, or cron tasks will double-fire.[/yellow]"
+                )
+                await asyncio.gather(*(loop.run() for loop in loops))
+                return
+
+            lock_name = _leader_lock_name(target)
+            console.print(f"[dim]lineup scheduler: waiting to become leader ({lock_name})...[/dim]")
+            async with arc.redix.lock(lock_name, timeout=_LEADER_LOCK_TIMEOUT_SECONDS) as token:
+                console.print(
+                    f"[bold green]lineup scheduler: elected leader[/bold green] "
+                    f"(fencing token {token})"
+                )
+                await asyncio.gather(*(loop.run() for loop in loops))
+
+        # ONE task spanning both the leader-election wait and the actual
+        # dispatch loop — a signal arriving while still waiting to become
+        # leader must cancel the wait, not just a dispatch loop that hasn't
+        # started yet. Cancellation unwinds through the `async with
+        # arc.redix.lock(...)` above exactly like any other exception,
+        # which is what releases the lock and stops its renewal loop.
+        run_task = asyncio.ensure_future(_dispatch_as_leader())
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):

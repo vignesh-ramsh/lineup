@@ -120,6 +120,7 @@ def _local_cron_offset() -> str | timedelta:
         pass
     return datetime.now().astimezone().utcoffset() or timedelta(0)
 
+
 CAPABILITY = "lineup"
 DEFAULT_QUEUE = "default"
 QUEUE_PREFIX = "lineup:"
@@ -428,7 +429,9 @@ class LineupProvider:
                 "process could resolve later. Give it a real module-level def instead."
             )
         if not qualname or not module_path:
-            raise TypeError(f"{fn!r} has no __module__/__qualname__ — not a plain importable function.")
+            raise TypeError(
+                f"{fn!r} has no __module__/__qualname__ — not a plain importable function."
+            )
         if "<locals>" in qualname:
             raise TypeError(
                 f"'{qualname}' is defined inside another function (a closure) — it has no path "
@@ -526,7 +529,9 @@ class LineupProvider:
 
         self._dispatch_tasks[queue] = broker.task(task_name=f"lineup._dispatch.{queue}")(_dispatch)
 
-    async def enqueue_by_path(self, fn: Any, *args: Any, queue: str = DEFAULT_QUEUE, **kwargs: Any) -> None:
+    async def enqueue_by_path(
+        self, fn: Any, *args: Any, queue: str = DEFAULT_QUEUE, **kwargs: Any
+    ) -> None:
         """Enqueue a PLAIN function — no `@arc.lineup.task(...)`/
         `@arc.relay.task(...)` decoration needed at all, callable from
         anywhere. Prefer `arc.relay.enqueue(fn, queue=..., ...)` in plugin
@@ -538,7 +543,9 @@ class LineupProvider:
         process minutes or hours later."""
         module_path, qualname = self.check_resolvable(fn)
         self._broker_for(queue)  # ensures the dispatch task below actually exists
-        await self._ensure_started(queue)  # a queue first touched after open() still gets a real startup()
+        await self._ensure_started(
+            queue
+        )  # a queue first touched after open() still gets a real startup()
         dispatch = self._dispatch_tasks[queue]
         await dispatch.kiq(module_path, qualname, list(args), kwargs)
 
