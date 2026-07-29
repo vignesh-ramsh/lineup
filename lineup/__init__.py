@@ -63,6 +63,19 @@ the facade for both):
     closure — is checked immediately, synchronously, at the call site
     (`check_resolvable()`), not discovered later inside a worker.
 
+Call context crosses the process boundary with the job. A durable job runs
+in a different process than the one that queued it, so relay's own
+`CallContext` contextvar (docs/arc.MD §3.11 — request_id / user / roles)
+cannot reach it. Instead the context travels as data: it is stamped onto
+the TaskIQ message as `arc_ctx_*` labels at kick time and rebound around
+the job on the worker side, so `arc.relay.context()` answers "which
+request, which user" identically in both processes, and every `_job_log`
+row records `request_id`/`triggered_by`. lineup deliberately treats those
+labels as OPAQUE — relay owns both encode and decode (`context_labels()`/
+`use_context_labels()`), which keeps the dependency direction right
+(relay optionally depends on lineup, never the reverse) and means a new
+context field needs no change in this module at all.
+
 Known, deliberate limitation of the broker choice (ListQueueBroker, a
 plain Redis LIST via BRPOP): a message is removed from the list the
 instant a worker pops it, before the task finishes running — so a durable
@@ -79,6 +92,7 @@ arc.MD §7).
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import logging
 import sys
@@ -141,6 +155,7 @@ class LineupProvider:
         self._redis_url = redis_url
         self._brokers: dict[str, ListQueueBroker] = {}
         self._tasks: dict[str, Any] = {}
+        self._task_queue: dict[str, str] = {}  # task_name -> queue, for enqueue()'s own Queued log row
         self._dispatch_tasks: dict[str, Any] = {}
         self._loading_plugin: str | None = None
         # Lifecycle: open() starts every broker that exists at that moment,
@@ -301,15 +316,32 @@ class LineupProvider:
             # WAS."
             async def wrapped(*args: Any, context: Context = TaskiqDepends(), **kwargs: Any) -> Any:
                 started_at = datetime.now(timezone.utc)
-                job_type = "Scheduler" if context.message.labels.get("schedule_id") else "Task"
+                labels = context.message.labels
+                job_type = "Scheduler" if labels.get("schedule_id") else "Task"
+                request_id, triggered_by = self._context_from(labels)
+                # A Scheduler-fired run never went through enqueue() (cron
+                # dispatch is TaskIQ's own internal scheduler loop, not
+                # something this module wraps at all) — so there is no
+                # Queued row for this task_id to update yet. _log_job_running
+                # is a harmless no-op in that case; _log_job_finished's own
+                # fallback insert (below) is what actually creates the row,
+                # exactly as this file always did before Queued tracking
+                # existed.
+                await self._log_job_running(task_id=context.message.task_id, started_at=started_at)
                 status, error = "success", None
                 try:
-                    return await fn(*args, **kwargs)
+                    # The job runs with the same call context the process
+                    # that queued it had — so arc.relay.context() inside a
+                    # durable job answers "which request, which user" just
+                    # like it does in the process that enqueued it.
+                    with self._bind_context(labels):
+                        return await fn(*args, **kwargs)
                 except Exception as exc:
                     status, error = "failed", f"{type(exc).__name__}: {exc}"
                     raise
                 finally:
-                    await self._write_job_log(
+                    await self._log_job_finished(
+                        task_id=context.message.task_id,
                         task_name=task_name,
                         queue=queue,
                         job_type=job_type,
@@ -318,18 +350,93 @@ class LineupProvider:
                         error=error,
                         started_at=started_at,
                         finished_at=datetime.now(timezone.utc),
+                        request_id=request_id,
+                        triggered_by=triggered_by,
                     )
 
             broker = self._broker_for(queue)
             decorated = broker.task(task_name=task_name, **labels)(wrapped)
             self._tasks[task_name] = decorated
+            self._task_queue[task_name] = queue
             return decorated
 
         return decorator
 
-    async def _write_job_log(
+    # ------------------------------------------------------------------ #
+    # _job_log lifecycle — Queued -> Running -> success/failed. `_job_log`
+    # is owned by `relay` (docs/arc.MD §3.11/§3.15) — lineup just writes
+    # into it, the same way any plugin can touch a table it doesn't own
+    # without needing to own its schema (ownership only matters for
+    # migration/diffing, §3.9). Every write here is best-effort: a DB
+    # hiccup logging a job must never mask the real job's own outcome.
+    #
+    # One row per job, updated in place across its lifetime — matched by
+    # `task_id` (TaskIQ's own id, stamped on the message at kick time,
+    # readable both from what .kiq() returns and from context.message on
+    # the worker side). _log_job_queued (called from enqueue()/
+    # enqueue_by_path(), the producer side — BEFORE any worker has touched
+    # the job) inserts the row; _log_job_running and _log_job_finished
+    # (both called from the dispatch wrappers below, the CONSUMER side)
+    # update that same row by task_id rather than inserting a fresh one,
+    # so the Execution Log shows one job's whole life as one row
+    # transitioning states, not three disconnected entries.
+    #
+    # Deliberately NOT covering every dispatch path: a Scheduler-fired
+    # cron job never goes through enqueue()/enqueue_by_path() at all (it
+    # fires via TaskIQ's own internal scheduler loop), so it never gets a
+    # Queued row — _log_job_finished's fallback INSERT below is exactly
+    # today's original single-write-at-the-end behavior, preserved
+    # unchanged for that case. The in-process fallback (no lineup
+    # installed) is untouched too — relay's own enqueue() fallback writes
+    # `_job_log` itself, independently of this file, and a job there runs
+    # essentially instantly (asyncio.create_task, no real queue), so
+    # there's no meaningful "queued and waiting" period to show anyway.
+    # ------------------------------------------------------------------ #
+    async def _log_job_queued(
         self,
         *,
+        task_id: str,
+        task_name: str,
+        queue: str,
+        job_type: str,
+        queued_by: str | None,
+        request_id: str | None,
+        triggered_by: str | None,
+    ) -> None:
+        try:
+            await arc.psqldb.insert(
+                "_job_log",
+                {
+                    "task_id": task_id,
+                    "task_name": task_name,
+                    "queue": queue,
+                    "executor": "lineup",
+                    "job_type": job_type,
+                    "queued_by": queued_by,
+                    "status": "Queued",
+                    "request_id": request_id,
+                    "triggered_by": triggered_by,
+                },
+            )
+        except Exception as exc:
+            logger.error(f"failed to write Queued _job_log row for {task_name}: {exc}")
+
+    async def _log_job_running(self, *, task_id: str, started_at: datetime) -> None:
+        try:
+            async with arc.psqldb.acquire() as conn:
+                await conn.execute(
+                    'UPDATE "_job_log" SET status = $1, started_at = $2 WHERE task_id = $3',
+                    "Running",
+                    started_at,
+                    task_id,
+                )
+        except Exception as exc:
+            logger.error(f"failed to mark _job_log row Running for task_id {task_id}: {exc}")
+
+    async def _log_job_finished(
+        self,
+        *,
+        task_id: str,
         task_name: str,
         queue: str,
         job_type: str,
@@ -338,31 +445,114 @@ class LineupProvider:
         error: str | None,
         started_at: datetime,
         finished_at: datetime,
+        request_id: str | None = None,
+        triggered_by: str | None = None,
     ) -> None:
-        """`_job_log` is owned by `relay` (docs/arc.MD §3.11/§3.15) — lineup
-        just inserts into it, the same way any plugin can insert into a
-        table it doesn't own without needing to own its schema (ownership
-        only matters for migration/diffing, §3.9). Best-effort: a DB
-        hiccup writing the log row must never mask the real task's own
-        outcome, which has already been decided by the time this runs."""
+        duration_ms = int((finished_at - started_at).total_seconds() * 1000)
         try:
-            await arc.psqldb.insert(
-                "_job_log",
-                {
-                    "task_name": task_name,
-                    "queue": queue,
-                    "executor": "lineup",
-                    "job_type": job_type,
-                    "queued_by": queued_by,
-                    "status": status,
-                    "error": error,
-                    "started_at": started_at,
-                    "finished_at": finished_at,
-                    "duration_ms": int((finished_at - started_at).total_seconds() * 1000),
-                },
-            )
+            async with arc.psqldb.acquire() as conn:
+                result = await conn.execute(
+                    'UPDATE "_job_log" SET status = $1, error = $2, started_at = $3, '
+                    'finished_at = $4, duration_ms = $5 WHERE task_id = $6',
+                    status,
+                    error,
+                    started_at,
+                    finished_at,
+                    duration_ms,
+                    task_id,
+                )
+            if result.endswith(" 0"):
+                # No Queued row to update (a Scheduler-fired job, per this
+                # method's own docstring above) — fall back to a plain
+                # insert, exactly this file's original, single-write
+                # behavior.
+                await arc.psqldb.insert(
+                    "_job_log",
+                    {
+                        "task_id": task_id,
+                        "task_name": task_name,
+                        "queue": queue,
+                        "executor": "lineup",
+                        "job_type": job_type,
+                        "queued_by": queued_by,
+                        "status": status,
+                        "error": error,
+                        "started_at": started_at,
+                        "finished_at": finished_at,
+                        "duration_ms": duration_ms,
+                        # Which request queued this job, and as whom — read
+                        # off the message labels the enqueuing PROCESS
+                        # stamped, so the trail survives that process being
+                        # long gone.
+                        "request_id": request_id,
+                        "triggered_by": triggered_by,
+                    },
+                )
         except Exception as exc:
             logger.error(f"failed to write _job_log row for {task_name}: {exc}")
+
+    # ------------------------------------------------------------------ #
+    # Call-context propagation across the process boundary (docs/arc.MD
+    # §3.11's CallContext). A durable job runs in a DIFFERENT process than
+    # the one that queued it, so relay's contextvar cannot reach it — the
+    # context travels as message labels instead: stamped on the kick here,
+    # rebound around the job on the worker side.
+    #
+    # lineup deliberately knows NOTHING about what is in those labels. It
+    # asks relay to encode them, moves an opaque dict of strings, and asks
+    # relay to decode them again. That keeps the dependency direction
+    # correct — relay optionally depends on lineup, never the reverse, so
+    # importing relay from here would be backwards — and means a future
+    # field on CallContext needs no edit in this file at all.
+    #
+    # The kernel lookup is lazy, PER CALL, for the same reason gateway's
+    # identity_middleware looks up authn per request rather than once at
+    # construction: arc's resolver only orders HARD requires strictly
+    # (§3.1), and lineup does not require relay at all, so a boot-time
+    # capture could easily miss it.
+    # ------------------------------------------------------------------ #
+    def _relay(self) -> Any | None:
+        return self._kernel.get("relay") if self._kernel.has("relay") else None
+
+    def _context_labels(self) -> dict[str, str]:
+        """The ambient call context, encoded for the wire — `{}` when relay
+        isn't installed, is too old to know about this, or there simply is
+        no context (a CLI run, a scheduled job with no originating
+        request). Never raises: failing to attach provenance metadata must
+        not stop a job from being queued."""
+        relay = self._relay()
+        encode = getattr(relay, "context_labels", None)
+        if not callable(encode):
+            return {}
+        try:
+            return encode() or {}
+        except Exception as exc:  # noqa: BLE001 - provenance must never block dispatch
+            logger.warning(f"could not encode call context for dispatch: {exc}")
+            return {}
+
+    def _bind_context(self, labels: Any):
+        """Rebind the call context a job was queued with, for the duration
+        of that job — the worker-side counterpart of _context_labels().
+        Falls back to a no-op context manager when relay isn't installed or
+        the labels can't be read, so a job always runs either way."""
+        relay = self._relay()
+        decode = getattr(relay, "use_context_labels", None)
+        if not callable(decode):
+            return contextlib.nullcontext()
+        try:
+            return decode(labels)
+        except Exception as exc:  # noqa: BLE001 - provenance must never break the job
+            logger.warning(f"could not restore call context for job: {exc}")
+            return contextlib.nullcontext()
+
+    @staticmethod
+    def _context_from(labels: Any) -> tuple[str | None, str | None]:
+        """(request_id, triggered_by) straight off the message labels, for
+        the `_job_log` row — read directly rather than through relay's
+        contextvar so the log line is still correct when relay isn't
+        installed at all."""
+        labels = labels or {}
+        return labels.get("arc_ctx_request_id"), labels.get("arc_ctx_user")
 
     def tasks(self) -> dict[str, Any]:
         """Every registered task, keyed by its `{plugin}.{fn.__name__}`
@@ -398,7 +588,29 @@ class LineupProvider:
                 f"loaded via register_tasks() first, or use enqueue_by_path()/"
                 f"arc.relay.enqueue() for a plain function instead."
             )
-        await fn.kiq(*args, **kwargs)
+        labels = self._context_labels()
+        request_id, triggered_by = self._context_from(labels)
+        if labels:
+            # .kicker().with_labels(...) rather than a plain .kiq(): this is
+            # TaskIQ's own supported way to attach PER-KICK labels (the same
+            # mechanism its scheduler uses to stamp schedule_id), as opposed
+            # to the STATIC labels declared once at broker.task() time.
+            task = await fn.kicker().with_labels(**labels).kiq(*args, **kwargs)
+        else:
+            task = await fn.kiq(*args, **kwargs)
+        # This call ALWAYS means "run this now" — a Scheduler-fired run
+        # never reaches this method (§ module docstring on _log_job_queued
+        # above), so job_type is unconditionally "Task" here, matching
+        # _register_dispatch_task's own dispatch-side invariant exactly.
+        await self._log_job_queued(
+            task_id=task.task_id,
+            task_name=fn.task_name,
+            queue=self._task_queue.get(fn.task_name, DEFAULT_QUEUE),
+            job_type="Task",
+            queued_by=fn.task_name.split(".")[0],
+            request_id=request_id,
+            triggered_by=triggered_by,
+        )
 
     # ------------------------------------------------------------------ #
     # Ad hoc dispatch — no @task decoration, no tasks/ directory. Only the
@@ -495,10 +707,23 @@ class LineupProvider:
         need to inspect a Context to tell the two apart the way `task()`'s
         wrapper does."""
 
-        async def _dispatch(module_path: str, qualname: str, args: list, kwargs: dict) -> None:
+        # `context: Context = TaskiqDepends()` is TaskIQ's own DI mechanism,
+        # the same one task()'s wrapper above uses — it's the only way to
+        # see this specific invocation's message labels, which is where the
+        # call context of the process that queued the job travels.
+        async def _dispatch(
+            module_path: str,
+            qualname: str,
+            args: list,
+            kwargs: dict,
+            context: Context = TaskiqDepends(),
+        ) -> None:
             started_at = datetime.now(timezone.utc)
             task_name = f"{module_path}.{qualname}"
             queued_by = module_path.split(".")[0] if module_path else None
+            labels = context.message.labels
+            request_id, triggered_by = self._context_from(labels)
+            await self._log_job_running(task_id=context.message.task_id, started_at=started_at)
             status, error = "success", None
             try:
                 if not self._dispatch_module_allowed(module_path):
@@ -511,12 +736,14 @@ class LineupProvider:
                 target: Any = module
                 for part in qualname.split("."):
                     target = getattr(target, part)
-                await target(*args, **kwargs)
+                with self._bind_context(labels):
+                    await target(*args, **kwargs)
             except Exception as exc:
                 status, error = "failed", f"{type(exc).__name__}: {exc}"
                 raise
             finally:
-                await self._write_job_log(
+                await self._log_job_finished(
+                    task_id=context.message.task_id,
                     task_name=task_name,
                     queue=queue,
                     job_type="Task",
@@ -525,6 +752,8 @@ class LineupProvider:
                     error=error,
                     started_at=started_at,
                     finished_at=datetime.now(timezone.utc),
+                    request_id=request_id,
+                    triggered_by=triggered_by,
                 )
 
         self._dispatch_tasks[queue] = broker.task(task_name=f"lineup._dispatch.{queue}")(_dispatch)
@@ -547,7 +776,23 @@ class LineupProvider:
             queue
         )  # a queue first touched after open() still gets a real startup()
         dispatch = self._dispatch_tasks[queue]
-        await dispatch.kiq(module_path, qualname, list(args), kwargs)
+        labels = self._context_labels()
+        request_id, triggered_by = self._context_from(labels)
+        if labels:
+            task = await dispatch.kicker().with_labels(**labels).kiq(
+                module_path, qualname, list(args), kwargs
+            )
+        else:
+            task = await dispatch.kiq(module_path, qualname, list(args), kwargs)
+        await self._log_job_queued(
+            task_id=task.task_id,
+            task_name=f"{module_path}.{qualname}",
+            queue=queue,
+            job_type="Task",
+            queued_by=module_path.split(".")[0] if module_path else None,
+            request_id=request_id,
+            triggered_by=triggered_by,
+        )
 
     # ------------------------------------------------------------------ #
     # Lifecycle — async def open()/close(), the same duck-typed contract
