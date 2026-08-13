@@ -92,6 +92,7 @@ arc.MD §7).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import importlib.util
 import logging
@@ -336,6 +337,18 @@ class LineupProvider:
                     # like it does in the process that enqueued it.
                     with self._bind_context(labels):
                         return await fn(*args, **kwargs)
+                except asyncio.CancelledError:
+                    # See the identical branch in _register_dispatch_task's
+                    # own _dispatch above for the full reasoning — this is
+                    # the SAME bug, in the OTHER dispatch wrapper (the one
+                    # @arc.relay.task(...)/@arc.lineup.task(...)-declared
+                    # jobs actually run through, arguably the more common
+                    # path of the two). CancelledError is a BaseException;
+                    # `except Exception` below never sees it, so `status`
+                    # would otherwise stay "success" for a job a worker
+                    # shutdown or timeout cut off mid-flight.
+                    status, error = "cancelled", "job was cancelled (worker shutdown or timeout)"
+                    raise
                 except Exception as exc:
                     status, error = "failed", f"{type(exc).__name__}: {exc}"
                     raise
@@ -738,6 +751,21 @@ class LineupProvider:
                     target = getattr(target, part)
                 with self._bind_context(labels):
                     await target(*args, **kwargs)
+            except asyncio.CancelledError:
+                # A worker shutting down (SIGTERM, a deploy, `arc lineup
+                # worker` stopping) cancels every in-flight dispatch task —
+                # CancelledError is a BaseException, not an Exception, so
+                # it would otherwise fall straight through the `except
+                # Exception` below and leave `status` at its "success"
+                # default: the job never ran to completion, but _job_log
+                # would say it did, with nothing to ever suggest otherwise.
+                # Recorded here, distinctly from an ordinary failure (this
+                # job may have done partial, unknown work — not the same
+                # claim as "it ran and raised"), and always re-raised:
+                # cancellation must never be swallowed, the caller's own
+                # shutdown/timeout logic depends on it actually propagating.
+                status, error = "cancelled", "job was cancelled (worker shutdown or timeout)"
+                raise
             except Exception as exc:
                 status, error = "failed", f"{type(exc).__name__}: {exc}"
                 raise
