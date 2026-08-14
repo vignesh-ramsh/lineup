@@ -97,6 +97,7 @@ import contextlib
 import importlib.util
 import logging
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -140,6 +141,13 @@ CAPABILITY = "lineup"
 DEFAULT_QUEUE = "default"
 QUEUE_PREFIX = "lineup:"
 
+# How long a claim on a _job_log row (claimed_by/lease_expires_at) is
+# honored before another poller treats it as abandoned and re-claims it —
+# same reasoning as relay/background_jobs.py's identical constant, applied
+# here to lineup's own reaper (_reap_and_run_stale) instead of relay's.
+_JOB_LEASE_SECONDS = 60
+_REAP_INTERVAL_SECONDS = 15
+
 logger = logging.getLogger("lineup")
 
 
@@ -157,8 +165,24 @@ class LineupProvider:
         self._brokers: dict[str, ListQueueBroker] = {}
         self._tasks: dict[str, Any] = {}
         self._task_queue: dict[str, str] = {}  # task_name -> queue, for enqueue()'s own Queued log row
+        # task_name -> (module_path, qualname) of the ORIGINAL, undecorated
+        # function a @task(...) wrapped — captured at registration time,
+        # before wrapping, because the decorated object itself has no
+        # stable importable path of its own. This is what lets a Queued
+        # row for a registered task carry a `payload` a reaper can
+        # reconstruct and run directly (_reap_and_run_stale), the same way
+        # an ad hoc enqueue_by_path() job already can via check_resolvable.
+        # A task whose fn doesn't resolve cleanly (a closure — unusual for
+        # a module-level @task() declaration, but not impossible) just gets
+        # no entry here: its payload stays None, exactly like an
+        # enqueue_by_path() call the reaper can't reconstruct either.
+        self._task_paths: dict[str, tuple[str, str]] = {}
         self._dispatch_tasks: dict[str, Any] = {}
         self._loading_plugin: str | None = None
+        # Claim identity for this process's rows (_job_log.claimed_by) +
+        # the reaper poll task started/stopped by open()/close().
+        self._worker_id = f"lineup-{uuid.uuid4().hex[:12]}"
+        self._reap_task: asyncio.Task | None = None
         # Lifecycle: open() starts every broker that exists at that moment,
         # but brokers are created LAZILY (_broker_for) — an ad hoc enqueue
         # to a brand-new queue name after startup creates one that open()
@@ -285,6 +309,12 @@ class LineupProvider:
             task_name = f"{plugin}.{fn.__name__}"
             if task_name in self._tasks:
                 raise RuntimeError(f"lineup task '{task_name}' is already registered.")
+
+            # Captured off the ORIGINAL fn, before `wrapped` below replaces
+            # it — see _task_paths' own docstring in __init__.
+            fn_qualname = getattr(fn, "__qualname__", "")
+            if fn_qualname and "<locals>" not in fn_qualname:
+                self._task_paths[task_name] = (fn.__module__, fn_qualname)
 
             labels: dict[str, Any] = {}
             if cron is not None:
@@ -415,7 +445,21 @@ class LineupProvider:
         queued_by: str | None,
         request_id: str | None,
         triggered_by: str | None,
+        payload: dict | None = None,
     ) -> None:
+        """`payload`, when present, is what makes this row durable — see
+        enqueue()/enqueue_by_path() below, which write it BEFORE ever
+        touching Redis, and _reap_and_run_stale, which reconstructs and
+        runs a job from `payload` alone if nothing ever picks it up off
+        Redis. None (a task whose original fn wasn't cleanly resolvable,
+        docs on _task_paths) means this row is observability-only, exactly
+        as every _job_log row was before durability existed — the insert
+        itself already best-effort (a DB hiccup here must not be treated
+        as "the job never got queued," only logged): if `payload` happens
+        to contain something that can't survive a JSONB round trip, this
+        whole insert fails the same way any other DB hiccup would, and the
+        job still dispatches normally over Redis right after — no
+        durability for that one call, no other change in behavior either."""
         try:
             await arc.psqldb.insert(
                 "_job_log",
@@ -429,6 +473,8 @@ class LineupProvider:
                     "status": "Queued",
                     "request_id": request_id,
                     "triggered_by": triggered_by,
+                    "payload": payload,
+                    "queued_at": datetime.now(timezone.utc),
                 },
             )
         except Exception as exc:
@@ -603,27 +649,55 @@ class LineupProvider:
             )
         labels = self._context_labels()
         request_id, triggered_by = self._context_from(labels)
-        if labels:
-            # .kicker().with_labels(...) rather than a plain .kiq(): this is
-            # TaskIQ's own supported way to attach PER-KICK labels (the same
-            # mechanism its scheduler uses to stamp schedule_id), as opposed
-            # to the STATIC labels declared once at broker.task() time.
-            task = await fn.kicker().with_labels(**labels).kiq(*args, **kwargs)
-        else:
-            task = await fn.kiq(*args, **kwargs)
-        # This call ALWAYS means "run this now" — a Scheduler-fired run
-        # never reaches this method (§ module docstring on _log_job_queued
-        # above), so job_type is unconditionally "Task" here, matching
-        # _register_dispatch_task's own dispatch-side invariant exactly.
+        queue = self._task_queue.get(fn.task_name, DEFAULT_QUEUE)
+
+        # Durability fix (docs/"Missing Failure-Mode Audits", items 15/19):
+        # the Queued row — WITH a reconstructable payload, when this task's
+        # original fn resolved cleanly at registration (_task_paths) — is
+        # written FIRST, before Redis is touched at all, using a task_id WE
+        # generate rather than one TaskIQ hands back afterward
+        # (AsyncKicker.with_task_id lets a kick carry a caller-chosen id).
+        # That ordering is the whole point: if the write never happens (a
+        # write that then rolls back — see relay/background_jobs.py's own
+        # gate on this, which is what decides whether enqueue() is even
+        # called at all), no message is EVER dispatched to Redis. If the
+        # write happens but the kick then fails (Redis down), the job is
+        # NOT lost the way it used to be — it's a durable "Queued" row with
+        # a payload, and _reap_and_run_stale will find and run it directly
+        # off that row on its next pass, without needing Redis at all.
+        task_id = str(uuid.uuid4())
+        original = self._task_paths.get(fn.task_name)
+        payload = (
+            {"module": original[0], "qualname": original[1], "args": list(args), "kwargs": kwargs}
+            if original is not None
+            else None
+        )
         await self._log_job_queued(
-            task_id=task.task_id,
+            task_id=task_id,
             task_name=fn.task_name,
-            queue=self._task_queue.get(fn.task_name, DEFAULT_QUEUE),
+            queue=queue,
             job_type="Task",
             queued_by=fn.task_name.split(".")[0],
             request_id=request_id,
             triggered_by=triggered_by,
+            payload=payload,
         )
+
+        kicker = fn.kicker().with_task_id(task_id)
+        try:
+            # .with_labels(...) rather than a plain .kiq(): this is
+            # TaskIQ's own supported way to attach PER-KICK labels (the same
+            # mechanism its scheduler uses to stamp schedule_id), as opposed
+            # to the STATIC labels declared once at broker.task() time.
+            if labels:
+                await kicker.with_labels(**labels).kiq(*args, **kwargs)
+            else:
+                await kicker.kiq(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - the row is already durable; see docstring above
+            logger.warning(
+                f"lineup kick failed for {fn.task_name} (task_id={task_id}): {exc} — "
+                f"job remains durably queued, the reaper will pick it up"
+            )
 
     # ------------------------------------------------------------------ #
     # Ad hoc dispatch — no @task decoration, no tasks/ directory. Only the
@@ -806,21 +880,35 @@ class LineupProvider:
         dispatch = self._dispatch_tasks[queue]
         labels = self._context_labels()
         request_id, triggered_by = self._context_from(labels)
-        if labels:
-            task = await dispatch.kicker().with_labels(**labels).kiq(
-                module_path, qualname, list(args), kwargs
-            )
-        else:
-            task = await dispatch.kiq(module_path, qualname, list(args), kwargs)
+
+        # Same write-before-push ordering as enqueue() above, and the same
+        # reasoning — see that method's docstring. check_resolvable()
+        # already proved module_path/qualname resolve, so this payload is
+        # always reconstructable (unlike enqueue()'s, which can be None).
+        task_id = str(uuid.uuid4())
+        payload = {"module": module_path, "qualname": qualname, "args": list(args), "kwargs": kwargs}
         await self._log_job_queued(
-            task_id=task.task_id,
+            task_id=task_id,
             task_name=f"{module_path}.{qualname}",
             queue=queue,
             job_type="Task",
             queued_by=module_path.split(".")[0] if module_path else None,
             request_id=request_id,
             triggered_by=triggered_by,
+            payload=payload,
         )
+
+        kicker = dispatch.kicker().with_task_id(task_id)
+        try:
+            if labels:
+                await kicker.with_labels(**labels).kiq(module_path, qualname, list(args), kwargs)
+            else:
+                await kicker.kiq(module_path, qualname, list(args), kwargs)
+        except Exception as exc:  # noqa: BLE001 - the row is already durable; see enqueue()'s docstring
+            logger.warning(
+                f"lineup kick failed for {module_path}.{qualname} (task_id={task_id}): {exc} — "
+                f"job remains durably queued, the reaper will pick it up"
+            )
 
     # ------------------------------------------------------------------ #
     # Lifecycle — async def open()/close(), the same duck-typed contract
@@ -837,6 +925,7 @@ class LineupProvider:
             if name not in self._started:
                 await broker.startup()
                 self._started.add(name)
+        self.start_reaper()
 
     async def _ensure_started(self, queue: str) -> None:
         """Start a lazily-created broker if the provider is already open —
@@ -846,6 +935,7 @@ class LineupProvider:
             self._started.add(queue)
 
     async def close(self) -> None:
+        await self.stop_reaper()
         for name, broker in self._brokers.items():
             if name in self._started:
                 await broker.shutdown()
@@ -854,6 +944,133 @@ class LineupProvider:
 
     async def health(self) -> dict:
         return {"ok": True, "queues": self.queues()}
+
+    # ------------------------------------------------------------------ #
+    # Durable-queue recovery — the worker-side half of items 15/19's fix
+    # (see enqueue()/enqueue_by_path()'s docstrings for the write side).
+    # start_reaper()/stop_reaper() are separate from open()/close() (which
+    # call them) because `arc lineup worker` deliberately bypasses open()
+    # for its own brokers (it sets is_worker_process on each one first,
+    # cli.py's worker() command) while still needing the reaper running —
+    # calling start_reaper() directly there gets it without double-starting
+    # any broker.
+    # ------------------------------------------------------------------ #
+    def start_reaper(self) -> None:
+        if self._reap_task is None:
+            self._reap_task = asyncio.create_task(self._reap_loop())
+
+    async def stop_reaper(self) -> None:
+        if self._reap_task is not None:
+            self._reap_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reap_task
+            self._reap_task = None
+
+    async def _reap_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_REAP_INTERVAL_SECONDS)
+            try:
+                await self._reap_and_run_stale()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one bad pass must not kill the loop
+                logger.error(f"lineup durable job reaper pass failed: {exc}")
+
+    async def _reap_and_run_stale(self, limit: int = 10) -> int:
+        """Claims lineup-owned jobs (`executor='lineup'`) abandoned by a
+        dead process — stuck 'Queued' because the kick to Redis never
+        landed or nobody's listening on that queue right now, or stuck
+        'Running' because the worker process that popped it off Redis died
+        mid-job (ListQueueBroker's own known limitation — see this module's
+        docstring: a message is gone from Redis the instant a worker BRPOPs
+        it, before the job finishes, so a worker crash after that point has
+        nothing left to redeliver from Redis itself). `FOR UPDATE SKIP
+        LOCKED` lets any number of processes with lineup open run this
+        concurrently with zero coordination.
+
+        Runs the job DIRECTLY off the row's own `payload` — dynamic import,
+        same _dispatch_module_allowed() trust boundary as a Redis-delivered
+        message gets (a reaped row is reconstructed from data this process
+        itself wrote via enqueue()/enqueue_by_path(), not something arriving
+        over the wire from elsewhere, but there is no reason to hold it to a
+        LOOSER standard than the Redis path just because of that) — never
+        through TaskIQ/Redis at all, which is the whole point: this is the
+        recovery path for when Redis already failed to deliver or never got
+        the chance to.
+
+        Only touches `executor='lineup', payload IS NOT NULL` rows — a
+        Scheduler-fired job (never went through enqueue() at all) or a
+        pre-durability legacy row has no payload to run from and is left
+        alone; relay runs the equivalent reaper for its own `executor=
+        'relay'` rows (relay/background_jobs.py's _reap_stale_jobs)."""
+        started_at = datetime.now(timezone.utc)
+        lease_until = started_at + timedelta(seconds=_JOB_LEASE_SECONDS)
+        async with arc.psqldb.acquire() as conn:
+            claimed = await conn.fetch(
+                'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
+                "started_at=COALESCE(started_at, $4) "
+                "WHERE id IN ("
+                '  SELECT id FROM "_job_log" '
+                "  WHERE executor=$5 AND payload IS NOT NULL "
+                "    AND status IN ('Queued', 'Running') "
+                "    AND (lease_expires_at IS NULL OR lease_expires_at < now()) "
+                "  ORDER BY queued_at NULLS FIRST "
+                "  LIMIT $6 "
+                "  FOR UPDATE SKIP LOCKED"
+                ") RETURNING *",
+                "Running",
+                self._worker_id,
+                lease_until,
+                started_at,
+                "lineup",
+                limit,
+            )
+        for row in claimed:
+            try:
+                await self._run_claimed_row(row)
+            except Exception as exc:  # noqa: BLE001 - already recorded on the row; keep reaping
+                logger.error(f"reaped lineup job {row['id']} failed: {exc}")
+        return len(claimed)
+
+    async def _run_claimed_row(self, row: Any) -> None:
+        payload = row["payload"] or {}
+        module_path, qualname = payload.get("module"), payload.get("qualname")
+        args, kwargs = payload.get("args") or [], payload.get("kwargs") or {}
+        row_id, task_name = row["id"], row["task_name"]
+        started_at = row["started_at"] or datetime.now(timezone.utc)
+        status, error = "success", None
+        try:
+            if not self._dispatch_module_allowed(module_path):
+                raise PermissionError(
+                    f"refusing to run reaped job '{module_path}.{qualname}' — its root module "
+                    f"is not an installed ARC plugin package."
+                )
+            module = importlib.import_module(module_path)
+            target: Any = module
+            for part in qualname.split("."):
+                target = getattr(target, part)
+            await target(*args, **kwargs)
+        except asyncio.CancelledError:
+            status, error = "cancelled", "reaper task was cancelled (process shutdown)"
+            raise
+        except Exception as exc:
+            status, error = "failed", f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            finished_at = datetime.now(timezone.utc)
+            try:
+                async with arc.psqldb.acquire() as conn:
+                    await conn.execute(
+                        'UPDATE "_job_log" SET status=$1, error=$2, finished_at=$3, '
+                        "duration_ms=$4 WHERE id=$5",
+                        status,
+                        error,
+                        finished_at,
+                        int((finished_at - started_at).total_seconds() * 1000),
+                        row_id,
+                    )
+            except Exception as log_exc:
+                logger.error(f"failed to write finished _job_log row for reaped {task_name}: {log_exc}")
 
 
 def register(kernel: Any) -> None:

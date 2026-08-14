@@ -264,6 +264,12 @@ def worker(
         for name in target:
             brokers[name].is_worker_process = True
             await brokers[name].startup()
+        # Bypasses arc.lineup.open() (which would restart brokers without
+        # is_worker_process set above) but still needs its durable-queue
+        # reaper running — a worker process is exactly where an abandoned
+        # 'Running' row (this same process, an earlier crash) most needs
+        # to be picked back up. See LineupProvider.start_reaper's docstring.
+        arc.lineup.start_reaper()
         await _open_all_capabilities(exclude=frozenset({"lineup"}))
         # Long-running ARC process: join the process registry + reload
         # bridge (SIGUSR1 / reload-stamp poll -> local system.reload), same
@@ -284,6 +290,7 @@ def worker(
         finally:
             console.print("[dim]lineup worker shutting down...[/dim]")
             await arc.events.uninstall_process_bridge()
+            await arc.lineup.stop_reaper()
             for name in target:
                 await brokers[name].shutdown()
             await _close_all_capabilities(exclude=frozenset({"lineup"}))
