@@ -5,6 +5,16 @@ follow-up — replaces `arc.relay.enqueue()`'s in-process-only fallback with
 a real durable backend, and adds a scheduler that didn't exist at all
 before this).
 
+Backend: whatever server `redix_url` points at — a real Redis, or Valkey
+(the wire-compatible fork; see redix/__init__.py's own module docstring
+for the full reasoning). `taskiq-redis`'s `ListQueueBroker`/`Receiver`,
+like `redis-py`, is a RESP client — it neither knows nor cares which of
+the two is listening on the other end of the socket. Every "Redis" below
+describing the queue/broker's general behavior (the LIST it pops from,
+what a worker crash does to an in-flight message) applies identically to
+Valkey; literal identifiers (`ListQueueBroker`, `taskiq-redis`,
+`redis.asyncio`) keep their real names either way, same as redix's own.
+
 Business plugins are not meant to import this module or call `arc.lineup`
 directly — `arc.relay.task(...)`/`arc.relay.register_tasks(...)`/
 `arc.relay.enqueue(...)` are the intended surface (docs/arc.MD §3.15),
@@ -17,15 +27,16 @@ ever removed.
 
 requires=["redix"] — reuses redix's already-resolved connection URL
 (kernel.get("redix").url) directly rather than declaring a second,
-duplicate `lineup_redis_url` setting. Two independent Redis client
+duplicate `lineup_redis_url` setting. Two independent RESP client
 libraries end up talking to the same instance (redix's own `redis.asyncio`
 client for cache/lock/pubsub, TaskIQ's own connection pool for the queue
 lists) — that's fine, they don't share connections and don't need to; the
-one thing that has to match is the URL itself.
+one thing that has to match is the URL itself, whichever server it's
+actually pointed at.
 
 Multiple named queues, not one global queue: `queue_name` on TaskIQ's own
-`ListQueueBroker` maps directly to a distinct Redis LIST key, so "a
-different type of queue" is just a different string — `@arc.lineup.task
+`ListQueueBroker` maps directly to a distinct list key on that instance,
+so "a different type of queue" is just a different string — `@arc.lineup.task
 (queue="high")` and `@arc.lineup.task(queue="default")` are two completely
 independent lists, consumed by whichever `arc lineup worker --queues=...`
 processes choose to listen to them. No fixed enum of queue names is
@@ -56,8 +67,8 @@ the facade for both):
     queue=..., ...)`, no decorator, no special directory, called from a
     whitelisted function, a hook, wherever. Nothing is pre-registered:
     `enqueue_by_path()` below sends only the function's own
-    `(module, qualname)` over Redis (TaskIQ never sends code, only a name
-    + arguments), and a worker re-imports the real function fresh when
+    `(module, qualname)` over the wire (TaskIQ never sends code, only a
+    name + arguments), and a worker re-imports the real function fresh when
     the job actually runs. The one real requirement this imposes — `fn`
     has to be a genuine plain, module-level function, not a lambda or a
     closure — is checked immediately, synchronously, at the call site
@@ -77,12 +88,14 @@ labels as OPAQUE — relay owns both encode and decode (`context_labels()`/
 context field needs no change in this module at all.
 
 Known, deliberate limitation of the broker choice (ListQueueBroker, a
-plain Redis LIST via BRPOP): a message is removed from the list the
+plain list via BRPOP): a message is removed from the list the
 instant a worker pops it, before the task finishes running — so a durable
 job now survives the *enqueuing* process (Gateway) crashing or restarting
 before a worker ever picks it up (the original problem this plugin
 exists to fix), but does NOT survive a *worker* crashing mid-task after
-having already popped the job. taskiq-redis also ships RedisStreamBroker
+having already popped the job (see enqueue()/_reap_and_run_stale below for
+how the durable-queue row now covers exactly that gap). taskiq-redis also
+ships RedisStreamBroker
 (consumer groups, ack/redelivery) for that stronger guarantee — not used
 here, to keep the first version simple; swapping the broker class is a
 contained, later change if a real need for it shows up (same
@@ -449,16 +462,16 @@ class LineupProvider:
     ) -> None:
         """`payload`, when present, is what makes this row durable — see
         enqueue()/enqueue_by_path() below, which write it BEFORE ever
-        touching Redis, and _reap_and_run_stale, which reconstructs and
+        touching Redis/Valkey, and _reap_and_run_stale, which reconstructs and
         runs a job from `payload` alone if nothing ever picks it up off
-        Redis. None (a task whose original fn wasn't cleanly resolvable,
+        Redis/Valkey. None (a task whose original fn wasn't cleanly resolvable,
         docs on _task_paths) means this row is observability-only, exactly
         as every _job_log row was before durability existed — the insert
         itself already best-effort (a DB hiccup here must not be treated
         as "the job never got queued," only logged): if `payload` happens
         to contain something that can't survive a JSONB round trip, this
         whole insert fails the same way any other DB hiccup would, and the
-        job still dispatches normally over Redis right after — no
+        job still dispatches normally over Redis/Valkey right after — no
         durability for that one call, no other change in behavior either."""
         try:
             await arc.psqldb.insert(
@@ -654,17 +667,18 @@ class LineupProvider:
         # Durability fix (docs/"Missing Failure-Mode Audits", items 15/19):
         # the Queued row — WITH a reconstructable payload, when this task's
         # original fn resolved cleanly at registration (_task_paths) — is
-        # written FIRST, before Redis is touched at all, using a task_id WE
-        # generate rather than one TaskIQ hands back afterward
+        # written FIRST, before Redis/Valkey is touched at all, using a
+        # task_id WE generate rather than one TaskIQ hands back afterward
         # (AsyncKicker.with_task_id lets a kick carry a caller-chosen id).
         # That ordering is the whole point: if the write never happens (a
         # write that then rolls back — see relay/background_jobs.py's own
         # gate on this, which is what decides whether enqueue() is even
-        # called at all), no message is EVER dispatched to Redis. If the
-        # write happens but the kick then fails (Redis down), the job is
-        # NOT lost the way it used to be — it's a durable "Queued" row with
-        # a payload, and _reap_and_run_stale will find and run it directly
-        # off that row on its next pass, without needing Redis at all.
+        # called at all), no message is EVER dispatched. If the write
+        # happens but the kick then fails (the Redis/Valkey server is
+        # down), the job is NOT lost the way it used to be — it's a
+        # durable "Queued" row with a payload, and _reap_and_run_stale
+        # will find and run it directly off that row on its next pass,
+        # without needing Redis/Valkey at all.
         task_id = str(uuid.uuid4())
         original = self._task_paths.get(fn.task_name)
         payload = (
@@ -701,7 +715,7 @@ class LineupProvider:
 
     # ------------------------------------------------------------------ #
     # Ad hoc dispatch — no @task decoration, no tasks/ directory. Only the
-    # function's own (module, qualname) crosses Redis, never the function
+    # function's own (module, qualname) crosses the wire, never the function
     # itself (TaskIQ sends a task NAME + arguments, always) — a worker
     # re-imports the real object fresh when the job runs, on its own side.
     # ------------------------------------------------------------------ #
@@ -763,8 +777,8 @@ class LineupProvider:
 
     def _dispatch_module_allowed(self, module_path: str) -> bool:
         """The generic dispatch task imports-and-calls whatever
-        (module, qualname) arrives in a Redis message — without a check,
-        anyone with write access to Redis gets arbitrary code execution in
+        (module, qualname) arrives in a Redis/Valkey message — without a check,
+        anyone with write access to that instance gets arbitrary code execution in
         the worker (e.g. `("os", "system", ["..."], {})`). This bounds it
         to code that belongs to this project: a module whose root is an
         installed plugin's own package (flat layout: package name == plugin
@@ -869,7 +883,7 @@ class LineupProvider:
         code (docs/arc.MD §3.15); this exists on lineup directly mainly
         for relay's own delegation.
 
-        Validates `fn` via check_resolvable() before ever touching Redis
+        Validates `fn` via check_resolvable() before ever touching Redis/Valkey
         — a bad reference fails here, synchronously, not inside a worker
         process minutes or hours later."""
         module_path, qualname = self.check_resolvable(fn)
@@ -978,24 +992,24 @@ class LineupProvider:
 
     async def _reap_and_run_stale(self, limit: int = 10) -> int:
         """Claims lineup-owned jobs (`executor='lineup'`) abandoned by a
-        dead process — stuck 'Queued' because the kick to Redis never
+        dead process — stuck 'Queued' because the kick to Redis/Valkey never
         landed or nobody's listening on that queue right now, or stuck
-        'Running' because the worker process that popped it off Redis died
+        'Running' because the worker process that popped it off Redis/Valkey died
         mid-job (ListQueueBroker's own known limitation — see this module's
-        docstring: a message is gone from Redis the instant a worker BRPOPs
+        docstring: a message is gone from the list the instant a worker BRPOPs
         it, before the job finishes, so a worker crash after that point has
-        nothing left to redeliver from Redis itself). `FOR UPDATE SKIP
+        nothing left to redeliver from Redis/Valkey itself). `FOR UPDATE SKIP
         LOCKED` lets any number of processes with lineup open run this
         concurrently with zero coordination.
 
         Runs the job DIRECTLY off the row's own `payload` — dynamic import,
-        same _dispatch_module_allowed() trust boundary as a Redis-delivered
+        same _dispatch_module_allowed() trust boundary as a Redis/Valkey-delivered
         message gets (a reaped row is reconstructed from data this process
         itself wrote via enqueue()/enqueue_by_path(), not something arriving
         over the wire from elsewhere, but there is no reason to hold it to a
-        LOOSER standard than the Redis path just because of that) — never
-        through TaskIQ/Redis at all, which is the whole point: this is the
-        recovery path for when Redis already failed to deliver or never got
+        LOOSER standard than that path just because of that) — never
+        through TaskIQ/Redis-or-Valkey at all, which is the whole point: this is the
+        recovery path for when Redis/Valkey already failed to deliver or never got
         the chance to.
 
         Only touches `executor='lineup', payload IS NOT NULL` rows — a

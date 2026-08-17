@@ -145,7 +145,7 @@ def _run_swallowing_shutdown_noise(coro: "asyncio.coroutines.Coroutine") -> None
     taskiq_redis/redis-py/anyio (verified directly: a worker that
     successfully durably dispatched and ran a real job still printed a raw
     TimeoutError traceback from an in-flight BRPOP on shutdown) — real
-    startup-time errors (Redis unreachable, an unknown --queues name) still
+    startup-time errors (Redis/Valkey unreachable, an unknown --queues name) still
     surface normally, since _resolve_queues()/broker.startup() raise
     before the "listening on ..." banner ever prints, well before this
     swallows anything."""
@@ -218,7 +218,7 @@ def _resolve_queues(requested: str | None) -> list[str]:
 
 @app.command()
 def status() -> None:
-    """Check connectivity to the Redis instance lineup would use (the same
+    """Check connectivity to the Redis/Valkey instance lineup would use (the same
     one redix is configured with — lineup has no separate URL of its own)."""
     url = _url_from_disk()
     parsed = urlparse(url)
@@ -235,7 +235,7 @@ def status() -> None:
     finally:
         client.close()
     console.print(
-        f"[bold green]lineup: OK[/bold green] ({elapsed * 1000:.0f}ms) via redix's redis_url"
+        f"[bold green]lineup: OK[/bold green] ({elapsed * 1000:.0f}ms) via redix's redix_url"
     )
     console.print("  run `arc lineup worker` / `arc lineup scheduler` to see registered queues.")
 
@@ -249,7 +249,7 @@ def worker(
     ),
 ) -> None:
     """Consume durable jobs from one or more named queues in this one
-    process (a queue is a Redis LIST — one Receiver per queue, run
+    process (a queue is a Redis/Valkey LIST — one Receiver per queue, run
     concurrently via asyncio.gather, not one process per queue)."""
     _boot()
 
@@ -314,7 +314,7 @@ def worker(
 # the active dispatcher (redix.lock()'s own background renewal, see
 # redix/redix/__init__.py, keeps it alive across the whole process
 # lifetime — not just one poll). 15s: generous enough that one missed
-# renewal (a GC pause, a transient Redis blip) doesn't cost leadership
+# renewal (a GC pause, a transient Redis/Valkey blip) doesn't cost leadership
 # outright, short enough that a genuinely crashed leader's replicas take
 # over within seconds, not minutes.
 _LEADER_LOCK_TIMEOUT_SECONDS = 15.0
