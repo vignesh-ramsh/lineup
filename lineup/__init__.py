@@ -332,7 +332,7 @@ class LineupProvider:
             labels: dict[str, Any] = {}
             if cron is not None:
                 try:
-                    pycron.is_now(cron, datetime.now(tz=timezone.utc))
+                    pycron.is_now(cron, arc.tz.utcnow())
                 except ValueError as exc:
                     raise CronValueError(
                         f"lineup task '{task_name}': invalid cron expression {cron!r} — {exc}"
@@ -359,7 +359,7 @@ class LineupProvider:
             # label only says "this task CAN be scheduled," not "this run
             # WAS."
             async def wrapped(*args: Any, context: Context = TaskiqDepends(), **kwargs: Any) -> Any:
-                started_at = datetime.now(timezone.utc)
+                started_at = arc.tz.utcnow()
                 labels = context.message.labels
                 job_type = "Scheduler" if labels.get("schedule_id") else "Task"
                 request_id, triggered_by = self._context_from(labels)
@@ -405,7 +405,7 @@ class LineupProvider:
                         status=status,
                         error=error,
                         started_at=started_at,
-                        finished_at=datetime.now(timezone.utc),
+                        finished_at=arc.tz.utcnow(),
                         request_id=request_id,
                         triggered_by=triggered_by,
                     )
@@ -487,7 +487,7 @@ class LineupProvider:
                     "request_id": request_id,
                     "triggered_by": triggered_by,
                     "payload": payload,
-                    "queued_at": datetime.now(timezone.utc),
+                    "queued_at": arc.tz.utcnow(),
                 },
             )
         except Exception as exc:
@@ -819,7 +819,7 @@ class LineupProvider:
             kwargs: dict,
             context: Context = TaskiqDepends(),
         ) -> None:
-            started_at = datetime.now(timezone.utc)
+            started_at = arc.tz.utcnow()
             task_name = f"{module_path}.{qualname}"
             queued_by = module_path.split(".")[0] if module_path else None
             labels = context.message.labels
@@ -867,7 +867,7 @@ class LineupProvider:
                     status=status,
                     error=error,
                     started_at=started_at,
-                    finished_at=datetime.now(timezone.utc),
+                    finished_at=arc.tz.utcnow(),
                     request_id=request_id,
                     triggered_by=triggered_by,
                 )
@@ -1017,8 +1017,8 @@ class LineupProvider:
         pre-durability legacy row has no payload to run from and is left
         alone; relay runs the equivalent reaper for its own `executor=
         'relay'` rows (relay/background_jobs.py's _reap_stale_jobs)."""
-        started_at = datetime.now(timezone.utc)
-        lease_until = started_at + timedelta(seconds=_JOB_LEASE_SECONDS)
+        started_at = arc.tz.utcnow()
+        lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS, base=started_at)
         async with arc.psqldb.acquire() as conn:
             claimed = await conn.fetch(
                 'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
@@ -1051,7 +1051,7 @@ class LineupProvider:
         module_path, qualname = payload.get("module"), payload.get("qualname")
         args, kwargs = payload.get("args") or [], payload.get("kwargs") or {}
         row_id, task_name = row["id"], row["task_name"]
-        started_at = row["started_at"] or datetime.now(timezone.utc)
+        started_at = row["started_at"] or arc.tz.utcnow()
         status, error = "success", None
         try:
             if not self._dispatch_module_allowed(module_path):
@@ -1071,7 +1071,7 @@ class LineupProvider:
             status, error = "failed", f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            finished_at = datetime.now(timezone.utc)
+            finished_at = arc.tz.utcnow()
             try:
                 async with arc.psqldb.acquire() as conn:
                     await conn.execute(
