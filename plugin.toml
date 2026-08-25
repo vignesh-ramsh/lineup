@@ -2,5 +2,5 @@
 name = "lineup"
 version = "0.1.0"
 capability = "lineup"
-requires = ["redix", "psqldb"]
+requires = ["redix", "pgdb"]
 optional_requires = []

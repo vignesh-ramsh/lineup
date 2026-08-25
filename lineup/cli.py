@@ -82,7 +82,7 @@ async def _open_all_capabilities(*, exclude: frozenset[str] = frozenset()) -> No
     does for every ASGI-served request — a worker/scheduler process isn't
     behind Gateway's lifespan at all, so it has to do this itself. Needed
     because a task function is ordinary plugin code and may call
-    arc.relay.*/arc.psqldb.*/arc.redix.* same as any request handler would.
+    arc.relay.*/arc.pgdb.*/arc.redix.* same as any request handler would.
 
     `exclude` lets worker/scheduler skip lineup's own brokers here — they
     set is_worker_process/is_scheduler_process on each broker themselves

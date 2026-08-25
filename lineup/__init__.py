@@ -479,7 +479,7 @@ class LineupProvider:
         job still dispatches normally over Redis/Valkey right after — no
         durability for that one call, no other change in behavior either."""
         try:
-            await arc.psqldb.insert(
+            await arc.pgdb.insert(
                 "_job_log",
                 {
                     "task_id": task_id,
@@ -500,7 +500,7 @@ class LineupProvider:
 
     async def _log_job_running(self, *, task_id: str, started_at: datetime) -> None:
         try:
-            async with arc.psqldb.acquire() as conn:
+            async with arc.pgdb.acquire() as conn:
                 await conn.execute(
                     'UPDATE "_job_log" SET status = $1, started_at = $2 WHERE task_id = $3',
                     "Running",
@@ -527,7 +527,7 @@ class LineupProvider:
     ) -> None:
         duration_ms = int((finished_at - started_at).total_seconds() * 1000)
         try:
-            async with arc.psqldb.acquire() as conn:
+            async with arc.pgdb.acquire() as conn:
                 result = await conn.execute(
                     'UPDATE "_job_log" SET status = $1, error = $2, started_at = $3, '
                     'finished_at = $4, duration_ms = $5 WHERE task_id = $6',
@@ -543,7 +543,7 @@ class LineupProvider:
                 # method's own docstring above) — fall back to a plain
                 # insert, exactly this file's original, single-write
                 # behavior.
-                await arc.psqldb.insert(
+                await arc.pgdb.insert(
                     "_job_log",
                     {
                         "task_id": task_id,
@@ -1035,7 +1035,7 @@ class LineupProvider:
         started_at = arc.tz.utcnow()
         lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS, base=started_at)
         claim_token = uuid.uuid4().hex
-        async with arc.psqldb.acquire() as conn:
+        async with arc.pgdb.acquire() as conn:
             claimed = await conn.fetch(
                 'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
                 "started_at=COALESCE(started_at, $4), claim_token=$5 "
@@ -1080,7 +1080,7 @@ class LineupProvider:
                 await asyncio.sleep(_LEASE_RENEW_INTERVAL_SECONDS)
                 lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS)
                 try:
-                    async with arc.psqldb.acquire() as conn:
+                    async with arc.pgdb.acquire() as conn:
                         renewed = await conn.fetchval(
                             'UPDATE "_job_log" SET lease_expires_at=$1 '
                             "WHERE id=$2 AND claim_token=$3 RETURNING id",
@@ -1135,7 +1135,7 @@ class LineupProvider:
                 await heartbeat
             finished_at = arc.tz.utcnow()
             try:
-                async with arc.psqldb.acquire() as conn:
+                async with arc.pgdb.acquire() as conn:
                     updated = await conn.fetchval(
                         'UPDATE "_job_log" SET status=$1, error=$2, finished_at=$3, '
                         "duration_ms=$4 WHERE id=$5 AND claim_token=$6 RETURNING id",
@@ -1165,4 +1165,4 @@ def register(kernel: Any) -> None:
     # (not best-effort/optional) so a project missing it gets a clear
     # boot-time error instead of every task's log write silently failing
     # forever.
-    kernel.export(CAPABILITY, provider, requires=["redix", "psqldb"], optional_requires=[])
+    kernel.export(CAPABILITY, provider, requires=["redix", "pgdb"], optional_requires=[])
