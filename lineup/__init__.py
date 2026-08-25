@@ -173,7 +173,7 @@ class CronValueError(ValueError):
     """Raised at registration time for a malformed cron expression —
     failing fast here beats discovering it only once the scheduler process
     happens to poll it (docs/arc.MD's general "hard error before it gets
-    weird" posture, e.g. psqldb's schema validation)."""
+    weird" posture, e.g. pgdb's schema validation)."""
 
 
 class LineupProvider:
@@ -729,7 +729,7 @@ class LineupProvider:
         process later — raises TypeError immediately if not, rather than
         letting a bad reference surface only once a worker tries and fails
         to run it (the same "fail fast, before it gets weird" posture used
-        everywhere else in this project, e.g. psqldb's schema validation).
+        everywhere else in this project, e.g. pgdb's schema validation).
 
         Rejects: a lambda (no stable name); a closure/nested function
         (`__qualname__` contains "<locals>" — there's no path to it from
@@ -931,12 +931,12 @@ class LineupProvider:
 
     # ------------------------------------------------------------------ #
     # Lifecycle — async def open()/close(), the same duck-typed contract
-    # every other capability with real connections uses (psqldb/redix);
+    # every other capability with real connections uses (pgdb/redix);
     # Gateway's ASGI lifespan calls both automatically for every capability
     # that has them (gateway/__init__.py's _open_all_capabilities). A CLI
     # process (worker/scheduler/status) isn't behind Gateway's lifespan at
     # all, so it calls these explicitly itself, same as authn's admin CLI
-    # already does for psqldb/redix.
+    # already does for pgdb/redix.
     # ------------------------------------------------------------------ #
     async def open(self) -> None:
         self._opened = True
@@ -1159,7 +1159,7 @@ class LineupProvider:
 def register(kernel: Any) -> None:
     redix = kernel.get("redix")
     provider = LineupProvider(kernel, redis_url=redix.url)
-    # psqldb: needed to write into relay's own `_job_log` table (§3.11/
+    # pgdb: needed to write into relay's own `_job_log` table (§3.11/
     # §3.15) whenever a task actually runs — not for durable dispatch
     # itself, which only ever needs redix. Declared as a hard requirement
     # (not best-effort/optional) so a project missing it gets a clear

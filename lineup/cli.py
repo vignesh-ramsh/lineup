@@ -2,7 +2,7 @@
 lineup.cli — `arc lineup ...` commands.
 
 Mounted via the `arc.plugins.cli` entry point, same mechanism as
-psqldb.cli/redix.cli/authn.cli. `worker` and `scheduler` do a real
+pgdb.cli/redix.cli/authn.cli. `worker` and `scheduler` do a real
 `arc.boot()` (task/schedule registration only happens inside every
 plugin's own register(), same reason authn's admin CLI needs a real boot
 — there's no other way to discover what's actually registered). `status`
@@ -33,7 +33,7 @@ from arc.runtime import find_project_root
 from arc.settings import SettingsManager
 
 # A narrow, precedented exception, same shape as authn.cli importing
-# psqldb.validation.ValidationError directly (docs/arc.MD §3.11) — lineup
+# pgdb.validation.ValidationError directly (docs/arc.MD §3.11) — lineup
 # hard-requires redix and deliberately never declares its own duplicate
 # settings key (lineup/__init__.py's module docstring), so this constant
 # IS the single source of truth for "which settings key holds the URL".
