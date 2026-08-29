@@ -276,6 +276,7 @@ def worker(
         # as every gateway worker does in its own lifespan startup.
         arc.events.install_process_bridge(role="lineup-worker")
         arc.metrics.start_exporter(role="lineup-worker")
+        arc.tracing.start_exporter(role="lineup-worker")
         arc.log.set_role("lineup-worker")
 
         shutdown_event = asyncio.Event()
@@ -292,6 +293,7 @@ def worker(
             console.print("[dim]lineup worker shutting down...[/dim]")
             await arc.events.uninstall_process_bridge()
             await arc.metrics.stop_exporter()
+            arc.tracing.stop_exporter()
             await arc.lineup.stop_reaper()
             for name in target:
                 await brokers[name].shutdown()
@@ -375,6 +377,7 @@ def scheduler(
         await _open_all_capabilities(exclude=frozenset({"lineup"}))
         arc.events.install_process_bridge(role="lineup-scheduler")
         arc.metrics.start_exporter(role="lineup-scheduler")
+        arc.tracing.start_exporter(role="lineup-scheduler")
         arc.log.set_role("lineup-scheduler")
 
         async def _dispatch_as_leader() -> None:
@@ -416,6 +419,7 @@ def scheduler(
             console.print("[dim]lineup scheduler shutting down...[/dim]")
             await arc.events.uninstall_process_bridge()
             await arc.metrics.stop_exporter()
+            arc.tracing.stop_exporter()
             for name in target:
                 await brokers[name].shutdown()
             await _close_all_capabilities(exclude=frozenset({"lineup"}))
