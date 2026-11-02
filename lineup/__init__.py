@@ -939,12 +939,22 @@ class LineupProvider:
     # already does for pgdb/redix.
     # ------------------------------------------------------------------ #
     async def open(self) -> None:
+        await self.open_producer()
+        self.start_reaper()
+
+    async def open_producer(self) -> None:
+        """open() WITHOUT the durable-job reaper: brokers are started, so
+        enqueue()/enqueue_by_path() work, but this process never claims and
+        runs another process's stale jobs. For short-lived processes that
+        only need to hand work to a worker — `arc pgdb migrate`, whose
+        routines and pgdb.premigration/postmigration handlers enqueue jobs
+        — where silently executing abandoned jobs mid-migration would be
+        wrong. close() undoes either form."""
         self._opened = True
         for name, broker in self._brokers.items():
             if name not in self._started:
                 await broker.startup()
                 self._started.add(name)
-        self.start_reaper()
 
     async def _ensure_started(self, queue: str) -> None:
         """Start a lazily-created broker if the provider is already open —
