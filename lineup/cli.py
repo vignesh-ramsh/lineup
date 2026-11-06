@@ -16,8 +16,11 @@ import asyncio
 import contextlib
 import logging
 import signal
+import threading
 import time
 import warnings
+from collections.abc import Awaitable, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 import redis as redis_sync
@@ -137,6 +140,21 @@ def _boot() -> None:
         arc.boot()
 
 
+#: Set by the SIGINT/SIGTERM handlers below. Whatever surfaces after it is set is the process
+#: unwinding from a graceful stop; whatever surfaces without it is a failure.
+_stop_requested = threading.Event()
+
+
+def _request_stop(stop: Callable[[], object]) -> Callable[[], None]:
+    """A signal handler that records that the stop was asked for, then does `stop`."""
+
+    def handler() -> None:
+        _stop_requested.set()
+        stop()
+
+    return handler
+
+
 def _run_swallowing_shutdown_noise(coro: "asyncio.coroutines.Coroutine") -> None:
     """`asyncio.run(coro)`, but treats whatever surfaces AFTER a graceful
     stop was requested (Ctrl-C/SIGTERM) as expected noise rather than a
@@ -144,11 +162,12 @@ def _run_swallowing_shutdown_noise(coro: "asyncio.coroutines.Coroutine") -> None
     doesn't always unwind as a clean asyncio.CancelledError through
     taskiq_redis/redis-py/anyio (verified directly: a worker that
     successfully durably dispatched and ran a real job still printed a raw
-    TimeoutError traceback from an in-flight BRPOP on shutdown) — real
-    startup-time errors (Redis/Valkey unreachable, an unknown --queues name) still
-    surface normally, since _resolve_queues()/broker.startup() raise
-    before the "listening on ..." banner ever prints, well before this
-    swallows anything."""
+    TimeoutError traceback from an in-flight BRPOP on shutdown).
+
+    An error with NO stop requested is a failure and is reported as one: printed, logged, exit
+    code 1. This used to swallow everything, so a scheduler that lost Redis printed
+    "shutting down" and exited 0 — to systemd, to `arc run` and to `arc status` a clean stop,
+    with the reason only at debug level."""
     try:
         asyncio.run(coro)
     except typer.Exit:
@@ -156,7 +175,12 @@ def _run_swallowing_shutdown_noise(coro: "asyncio.coroutines.Coroutine") -> None
     except (KeyboardInterrupt, SystemExit):
         pass
     except BaseException as exc:
-        logger.debug(f"shutdown-time noise (harmless): {exc!r}")
+        if _stop_requested.is_set():
+            logger.debug(f"shutdown-time noise (harmless): {exc!r}")
+            return
+        logger.error("lineup process stopped by an error: %r", exc, exc_info=exc)
+        err_console.print(f"lineup stopped because of an error: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 def job_concurrency_per_queue(n_queues: int, *, configured: int | None, pool_size: int | None) -> int | None:
@@ -351,6 +375,9 @@ def worker(
 # outright, short enough that a genuinely crashed leader's replicas take
 # over within seconds, not minutes.
 _LEADER_LOCK_TIMEOUT_SECONDS = 15.0
+#: While Redis is unreachable a scheduler keeps trying: first after 1 s, then doubling up to 10 s.
+_REDIS_RETRY_FIRST_SECONDS = 1.0
+_REDIS_RETRY_MAX_SECONDS = 10.0
 
 
 def _leader_lock_name(target: list[str]) -> str:
@@ -360,6 +387,58 @@ def _leader_lock_name(target: list[str]) -> str:
     process-wide lock; two processes polling the SAME set are exactly the
     double-fire risk this exists to prevent."""
     return f"lineup:scheduler:leader:{','.join(sorted(target))}"
+
+
+async def _run_as_leader(
+    lock: Callable[..., Any], lock_name: str, run: Callable[[], Awaitable[None]]
+) -> None:
+    """Wait for the leader lock, `run()` while holding it, and handle Redis the way a long-lived
+    scheduler must:
+
+    * another scheduler holds the lock (redix raises LockError after one lock timeout): stay on
+      standby and keep waiting — that is what makes a second scheduler a standby at all. This
+      used to end the process, silently, after 15 s;
+    * Redis is unreachable, or drops us while leading: say so once, retry with a growing delay
+      (1 s up to 10 s) and go back to waiting for the lock. Giving up would only have systemd
+      restart the process into the same outage until it marks the unit failed;
+    * a stop was requested (SIGINT/SIGTERM): return, whatever releasing the lock raised."""
+    console.print(f"[dim]lineup scheduler: waiting to become leader ({lock_name})...[/dim]")
+    retry_in = _REDIS_RETRY_FIRST_SECONDS
+    standing_by = redis_down = False
+    while not _stop_requested.is_set():
+        try:
+            async with lock(lock_name, timeout=_LEADER_LOCK_TIMEOUT_SECONDS) as token:
+                standing_by = redis_down = False
+                retry_in = _REDIS_RETRY_FIRST_SECONDS
+                console.print(
+                    f"[bold green]lineup scheduler: elected leader[/bold green] "
+                    f"(fencing token {token})"
+                )
+                await run()
+            return
+        except redis_sync.exceptions.RedisError as exc:
+            if _stop_requested.is_set():
+                return  # e.g. releasing the lock failed while stopping: the stop is what matters
+            if isinstance(exc, redis_sync.exceptions.LockError):
+                redis_down = False
+                retry_in = _REDIS_RETRY_FIRST_SECONDS
+                if not standing_by:
+                    standing_by = True
+                    console.print(
+                        "[dim]lineup scheduler: another scheduler is the leader — standing "
+                        "by to take over[/dim]"
+                    )
+                continue
+            standing_by = False
+            if not redis_down:
+                redis_down = True
+                logger.warning("lineup scheduler cannot reach Redis: %r", exc)
+                err_console.print(
+                    f"lineup scheduler: cannot reach Redis ({type(exc).__name__}: {exc}) — "
+                    f"retrying every {_REDIS_RETRY_MAX_SECONDS:g}s at most"
+                )
+            await asyncio.sleep(retry_in)
+            retry_in = min(retry_in * 2, _REDIS_RETRY_MAX_SECONDS)
 
 
 @app.command()
@@ -419,14 +498,10 @@ def scheduler(
                 await asyncio.gather(*(loop.run() for loop in loops))
                 return
 
-            lock_name = _leader_lock_name(target)
-            console.print(f"[dim]lineup scheduler: waiting to become leader ({lock_name})...[/dim]")
-            async with arc.redix.lock(lock_name, timeout=_LEADER_LOCK_TIMEOUT_SECONDS) as token:
-                console.print(
-                    f"[bold green]lineup scheduler: elected leader[/bold green] "
-                    f"(fencing token {token})"
-                )
+            async def run_loops() -> None:
                 await asyncio.gather(*(loop.run() for loop in loops))
+
+            await _run_as_leader(arc.redix.lock, _leader_lock_name(target), run_loops)
 
         # ONE task spanning both the leader-election wait and the actual
         # dispatch loop — a signal arriving while still waiting to become
@@ -438,7 +513,7 @@ def scheduler(
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
-                loop.add_signal_handler(sig, run_task.cancel)
+                loop.add_signal_handler(sig, _request_stop(run_task.cancel))
 
         try:
             await run_task
