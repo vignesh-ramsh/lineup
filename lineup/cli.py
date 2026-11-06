@@ -42,7 +42,7 @@ from arc.settings import SettingsManager
 # IS the single source of truth for "which settings key holds the URL".
 # Hardcoding the string "redix_url" here instead would silently go stale
 # if redix ever renamed it; importing the constant can't.
-from redix import URL_KEY
+from redix import URL_KEY, LockLostError
 
 app = typer.Typer(help="Commands for the lineup provider (durable jobs + scheduling).")
 console = Console()
@@ -401,21 +401,37 @@ async def _run_as_leader(
     * Redis is unreachable, or drops us while leading: say so once, retry with a growing delay
       (1 s up to 10 s) and go back to waiting for the lock. Giving up would only have systemd
       restart the process into the same outage until it marks the unit failed;
+    * while leading, the lock's renewal fails (the lock becomes uncertain or lost, redix's
+      LockLostError): stop dispatching AT ONCE and go back to contending. Not knowing that we
+      still lead is treated like not leading — a second scheduler may have taken over, and two
+      leaders fire every cron job twice. A few seconds without dispatching is the cheaper mistake;
     * a stop was requested (SIGINT/SIGTERM): return, whatever releasing the lock raised."""
     console.print(f"[dim]lineup scheduler: waiting to become leader ({lock_name})...[/dim]")
     retry_in = _REDIS_RETRY_FIRST_SECONDS
     standing_by = redis_down = False
     while not _stop_requested.is_set():
         try:
-            async with lock(lock_name, timeout=_LEADER_LOCK_TIMEOUT_SECONDS) as token:
+            guard = lock(lock_name, timeout=_LEADER_LOCK_TIMEOUT_SECONDS)
+            async with guard as token:
                 standing_by = redis_down = False
                 retry_in = _REDIS_RETRY_FIRST_SECONDS
                 console.print(
                     f"[bold green]lineup scheduler: elected leader[/bold green] "
                     f"(fencing token {token})"
                 )
-                await run()
+                await guard.run_while_held(run)
             return
+        except LockLostError as exc:
+            if _stop_requested.is_set():
+                return
+            standing_by = redis_down = False
+            retry_in = _REDIS_RETRY_FIRST_SECONDS
+            logger.warning("lineup scheduler lost the leader lock: %s", exc)
+            err_console.print(
+                f"lineup scheduler: no longer sure it is the leader ({exc}) — stopped dispatching; "
+                f"contending for the lock again"
+            )
+            continue
         except redis_sync.exceptions.RedisError as exc:
             if _stop_requested.is_set():
                 return  # e.g. releasing the lock failed while stopping: the stop is what matters
