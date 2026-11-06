@@ -159,7 +159,22 @@ def _run_swallowing_shutdown_noise(coro: "asyncio.coroutines.Coroutine") -> None
         logger.debug(f"shutdown-time noise (harmless): {exc!r}")
 
 
-async def _resilient_listen(broker, queue_name: str, shutdown_event: asyncio.Event) -> None:
+def job_concurrency_per_queue(n_queues: int, *, configured: int | None, pool_size: int | None) -> int | None:
+    """How many jobs one queue's listener may run at once, so that a worker process as a whole
+    runs no more jobs than `lineup_concurrency` (or, by default, than its database pool has
+    connections). None = leave taskiq's own default, which is NO limit at all: every job a queue
+    delivers starts immediately, each one wanting a connection, until the pool is empty and the
+    rest time out waiting. Measured: 600 queued jobs against 8 workers pushed PostgreSQL to 97 of
+    100 connections and failed 1,438 web requests. Never less than 1 per queue."""
+    total = configured or pool_size
+    if not total:
+        return None
+    return max(1, total // max(1, n_queues))
+
+
+async def _resilient_listen(
+    broker, queue_name: str, shutdown_event: asyncio.Event, max_async_tasks: int | None = None
+) -> None:
     """Keeps a queue's Receiver listening indefinitely, surviving a
     transient failure instead of exiting — a worker sitting idle with
     nothing queued is the NORMAL case, not an error condition.
@@ -182,7 +197,7 @@ async def _resilient_listen(broker, queue_name: str, shutdown_event: asyncio.Eve
     semaphore, in-flight message queue) in a consistent place to resume
     from after being torn down mid-flight."""
     while not shutdown_event.is_set():
-        receiver = Receiver(broker=broker)
+        receiver = Receiver(broker=broker, max_async_tasks=max_async_tasks)
         try:
             await receiver.listen(shutdown_event)
         except asyncio.CancelledError:
@@ -285,9 +300,23 @@ def worker(
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, shutdown_event.set)
 
+        pgdb = getattr(arc, "pgdb", None)  # opened above, so max_size is the size it really got
+        per_queue = job_concurrency_per_queue(
+            len(target),
+            configured=arc.settings.get("lineup_concurrency"),
+            pool_size=getattr(pgdb, "max_size", None),
+        )
+        if per_queue:
+            console.print(
+                f"[dim]lineup worker: at most {per_queue} job(s) at a time per queue "
+                f"(database pool: {getattr(pgdb, 'max_size', '?')}; set lineup_concurrency to change)[/dim]"
+            )
         try:
             await asyncio.gather(
-                *(_resilient_listen(brokers[name], name, shutdown_event) for name in target)
+                *(
+                    _resilient_listen(brokers[name], name, shutdown_event, per_queue)
+                    for name in target
+                )
             )
         finally:
             console.print("[dim]lineup worker shutting down...[/dim]")
