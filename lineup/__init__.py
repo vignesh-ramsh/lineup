@@ -399,6 +399,7 @@ class LineupProvider:
                     raise
                 except Exception as exc:
                     status, error = "failed", f"{type(exc).__name__}: {exc}"
+                    arc.errors.capture(exc, source="lineup", job=task_name, queue=queue, kind=job_type)
                     raise
                 finally:
                     await self._log_job_finished(
@@ -861,6 +862,7 @@ class LineupProvider:
                 raise
             except Exception as exc:
                 status, error = "failed", f"{type(exc).__name__}: {exc}"
+                arc.errors.capture(exc, source="lineup", job=task_name, queue=queue, kind="Task")
                 raise
             finally:
                 await self._log_job_finished(
@@ -1138,6 +1140,7 @@ class LineupProvider:
             raise
         except Exception as exc:
             status, error = "failed", f"{type(exc).__name__}: {exc}"
+            arc.errors.capture(exc, source="lineup", job=task_name, kind="Reaped")
             raise
         finally:
             heartbeat.cancel()

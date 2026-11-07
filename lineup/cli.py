@@ -179,6 +179,9 @@ def _run_swallowing_shutdown_noise(coro: "asyncio.coroutines.Coroutine") -> None
             logger.debug(f"shutdown-time noise (harmless): {exc!r}")
             return
         logger.error("lineup process stopped by an error: %r", exc, exc_info=exc)
+        if isinstance(exc, Exception):
+            arc.errors.capture(exc, source="lineup", stage="process")
+            arc.errors.flush()  # this process is about to exit: let the report leave first
         err_console.print(f"lineup stopped because of an error: {type(exc).__name__}: {exc}")
         raise typer.Exit(code=1) from exc
 
