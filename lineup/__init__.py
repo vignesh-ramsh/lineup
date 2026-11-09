@@ -1177,11 +1177,10 @@ def register(kernel: Any) -> None:
         CONCURRENCY_KEY,
         type=int,
         default=0,
-        doc="How many jobs ONE worker process runs at the same time, across all the queues it "
-        "consumes. 0 (default) = as many as its database pool has connections, so a burst of "
-        "jobs waits in the queue instead of piling up inside the worker, all competing for "
-        "connections and timing out. Raise it for jobs that mostly wait on something else "
-        "(HTTP calls, email) — and the pool with it.",
+        doc="How many background jobs one worker runs at the same time, across all the queues it handles. `0` (the "
+        "default) means as many as it has database connections, so a burst of jobs waits in the queue instead "
+        "of piling up inside the worker and timing out. Raise it for jobs that mostly wait for something else "
+        "(web calls, email), and raise the database connections with it.",
     )
     redix = kernel.get("redix")
     provider = LineupProvider(kernel, redis_url=redix.url)
