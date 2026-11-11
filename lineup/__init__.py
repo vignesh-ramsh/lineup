@@ -44,6 +44,12 @@ enforced here — "default"/"high"/"low" below are a suggested convention,
 not a hard requirement, same "business declares it, framework doesn't
 gatekeep it" posture as SELECT field options elsewhere in this project.
 
+By default a worker runs only the queue(s) it was started for. The setting
+`lineup_share_idle_workers` lets an idle worker also run jobs of other queues
+(`lineup_strict_queues` names queues that stay strictly separate); see
+sharing.py for the rules (home queue first, borrowed jobs share the worker's
+own job slots and never use the last one).
+
 Scheduling never fires at registration time. This was an explicit
 requirement, not an incidental property: a scheduled job is a TaskIQ task
 carrying a `schedule=[{"cron": "..."}]` label (TaskIQ's own
@@ -165,8 +171,37 @@ _JOB_LEASE_SECONDS = 60
 # A third of the lease — same margin redix's own _RenewingLock uses.
 _LEASE_RENEW_INTERVAL_SECONDS = _JOB_LEASE_SECONDS / 3
 _REAP_INTERVAL_SECONDS = 15
+# Setting: how long a job may sit in "Queued" before the reaper treats it as
+# undelivered. A job waiting its turn in the Redis list (every worker busy)
+# is NOT abandoned, and a reaper that took it after a few seconds ran it a
+# second time when a worker finally popped the message. 120 s is longer
+# than a normal wait and short enough that a job whose kick failed (Redis
+# down) still runs promptly through the database.
+REQUEUE_GRACE_KEY = "lineup_requeue_grace_seconds"
+_DEFAULT_REQUEUE_GRACE_SECONDS = 120
+# A "Running" row with no lease was written by a worker running code from
+# before workers took a lease. Such a row is only reclaimed once it has been
+# running this long, since there is nothing else to say it is dead.
+_LEGACY_RUNNING_GRACE_SECONDS = 600
 
 logger = logging.getLogger("lineup")
+
+
+class _Claim:
+    """What a worker learned when it tried to claim its `_job_log` row.
+
+    `skip` - another process already owns (or finished) this job; do not run
+    it. `token`/`row_id` - set when this worker holds the claim, so it can
+    renew the lease and fence its final write. Both unset - no row exists
+    (a Scheduler-fired job) or the log could not be reached; the job runs
+    exactly as it did before claims existed."""
+
+    __slots__ = ("row_id", "skip", "token")
+
+    def __init__(self, *, skip: bool = False, row_id: Any = None, token: str | None = None) -> None:
+        self.skip = skip
+        self.row_id = row_id
+        self.token = token
 
 
 class CronValueError(ValueError):
@@ -368,15 +403,24 @@ class LineupProvider:
                 labels = context.message.labels
                 job_type = "Scheduler" if labels.get("schedule_id") else "Task"
                 request_id, triggered_by = self._context_from(labels)
-                # A Scheduler-fired run never went through enqueue() (cron
+                # Claim the row before running (see _claim_for_run). A
+                # Scheduler-fired run never went through enqueue() (cron
                 # dispatch is TaskIQ's own internal scheduler loop, not
                 # something this module wraps at all) — so there is no
-                # Queued row for this task_id to update yet. _log_job_running
-                # is a harmless no-op in that case; _log_job_finished's own
-                # fallback insert (below) is what actually creates the row,
-                # exactly as this file always did before Queued tracking
-                # existed.
-                await self._log_job_running(task_id=context.message.task_id, started_at=started_at)
+                # Queued row to claim; the job simply runs, and
+                # _log_job_finished's own fallback insert (below) is what
+                # creates the row, exactly as this file always did before
+                # Queued tracking existed. A row that is already
+                # Running/finished means another process has the job (the
+                # reaper, or a duplicate delivery): this one must not run it.
+                claim = await self._claim_for_run(task_id=context.message.task_id, started_at=started_at)
+                if claim.skip:
+                    logger.warning(
+                        f"skipping {task_name} (task_id={context.message.task_id}): "
+                        f"already claimed or finished by another process"
+                    )
+                    return None
+                heartbeat = self._start_heartbeat(claim)
                 status, error = "success", None
                 try:
                     # The job runs with the same call context the process
@@ -402,6 +446,7 @@ class LineupProvider:
                     arc.errors.capture(exc, source="lineup", job=task_name, queue=queue, kind=job_type)
                     raise
                 finally:
+                    await self._stop_heartbeat(heartbeat)
                     await self._log_job_finished(
                         task_id=context.message.task_id,
                         task_name=task_name,
@@ -414,6 +459,7 @@ class LineupProvider:
                         finished_at=arc.tz.utcnow(),
                         request_id=request_id,
                         triggered_by=triggered_by,
+                        claim_token=claim.token,
                     )
 
             broker = self._broker_for(queue)
@@ -437,7 +483,7 @@ class LineupProvider:
     # readable both from what .kiq() returns and from context.message on
     # the worker side). _log_job_queued (called from enqueue()/
     # enqueue_by_path(), the producer side — BEFORE any worker has touched
-    # the job) inserts the row; _log_job_running and _log_job_finished
+    # the job) inserts the row; _claim_for_run and _log_job_finished
     # (both called from the dispatch wrappers below, the CONSUMER side)
     # update that same row by task_id rather than inserting a fresh one,
     # so the Execution Log shows one job's whole life as one row
@@ -499,17 +545,61 @@ class LineupProvider:
         except Exception as exc:
             logger.error(f"failed to write Queued _job_log row for {task_name}: {exc}")
 
-    async def _log_job_running(self, *, task_id: str, started_at: datetime) -> None:
+    async def _claim_for_run(self, *, task_id: str, started_at: datetime) -> _Claim:
+        """The worker-side start of a job: claim the job's `_job_log` row
+        before running it, in ONE statement.
+
+        `UPDATE ... WHERE task_id = $x AND status = 'Queued'` is the claim.
+        Whoever's update matches runs the job; a process whose update
+        matches nothing finds the row already Running/finished (the reaper
+        ran it, or this message was delivered twice) and must not run it
+        again. The claim carries a lease and a token, so while the job runs
+        a heartbeat keeps the lease alive and the reaper can tell a job that
+        is still running from one whose worker died.
+
+        No row at all (a Scheduler-fired job never went through enqueue(),
+        or the Queued insert failed) means there is nothing to claim: the
+        job runs as it always did. A database error here is logged and also
+        lets the job run - the log must never decide whether work happens.
+        """
+        token = uuid.uuid4().hex
+        lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS, base=started_at)
         try:
             async with arc.pgdb.acquire() as conn:
-                await conn.execute(
-                    'UPDATE "_job_log" SET status = $1, started_at = $2 WHERE task_id = $3',
+                row_id = await conn.fetchval(
+                    'UPDATE "_job_log" SET status = $1, claimed_by = $2, claim_token = $3, '
+                    "lease_expires_at = $4, started_at = $5 "
+                    "WHERE task_id = $6 AND status = $7 RETURNING id",
                     "Running",
+                    self._worker_id,
+                    token,
+                    lease_until,
                     started_at,
                     task_id,
+                    "Queued",
+                )
+                if row_id is not None:
+                    return _Claim(row_id=row_id, token=token)
+                already_logged = await conn.fetchval(
+                    'SELECT 1 FROM "_job_log" WHERE task_id = $1 LIMIT 1', task_id
                 )
         except Exception as exc:
-            logger.error(f"failed to mark _job_log row Running for task_id {task_id}: {exc}")
+            logger.error(f"failed to claim _job_log row for task_id {task_id}: {exc}")
+            return _Claim()
+        return _Claim(skip=already_logged is not None)
+
+    def _start_heartbeat(self, claim: _Claim) -> asyncio.Task | None:
+        if claim.token is None:
+            return None
+        return asyncio.create_task(self._heartbeat_job_lease(claim.row_id, claim.token))
+
+    @staticmethod
+    async def _stop_heartbeat(heartbeat: asyncio.Task | None) -> None:
+        if heartbeat is None:
+            return
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
 
     async def _log_job_finished(
         self,
@@ -525,9 +615,33 @@ class LineupProvider:
         finished_at: datetime,
         request_id: str | None = None,
         triggered_by: str | None = None,
+        claim_token: str | None = None,
     ) -> None:
+        """`claim_token`, when this worker claimed the row (_claim_for_run),
+        fences the write: the update only lands while the row still carries
+        that token. If the lease lapsed and the reaper took the job over,
+        this worker's result must not overwrite the one now running, and the
+        fallback insert below must not add a second row for the job."""
         duration_ms = int((finished_at - started_at).total_seconds() * 1000)
         try:
+            if claim_token is not None:
+                async with arc.pgdb.acquire() as conn:
+                    updated = await conn.fetchval(
+                        'UPDATE "_job_log" SET status = $1, error = $2, finished_at = $3, '
+                        "duration_ms = $4 WHERE task_id = $5 AND claim_token = $6 RETURNING id",
+                        status,
+                        error,
+                        finished_at,
+                        duration_ms,
+                        task_id,
+                        claim_token,
+                    )
+                if updated is None:
+                    logger.warning(
+                        f"{task_name} (task_id={task_id}) finished ({status}) but its claim was "
+                        f"taken over by another process - not overwriting that process's result"
+                    )
+                return
             async with arc.pgdb.acquire() as conn:
                 result = await conn.execute(
                     'UPDATE "_job_log" SET status = $1, error = $2, started_at = $3, '
@@ -830,7 +944,14 @@ class LineupProvider:
             queued_by = module_path.split(".")[0] if module_path else None
             labels = context.message.labels
             request_id, triggered_by = self._context_from(labels)
-            await self._log_job_running(task_id=context.message.task_id, started_at=started_at)
+            claim = await self._claim_for_run(task_id=context.message.task_id, started_at=started_at)
+            if claim.skip:
+                logger.warning(
+                    f"skipping {task_name} (task_id={context.message.task_id}): "
+                    f"already claimed or finished by another process"
+                )
+                return
+            heartbeat = self._start_heartbeat(claim)
             status, error = "success", None
             try:
                 if not self._dispatch_module_allowed(module_path):
@@ -865,6 +986,7 @@ class LineupProvider:
                 arc.errors.capture(exc, source="lineup", job=task_name, queue=queue, kind="Task")
                 raise
             finally:
+                await self._stop_heartbeat(heartbeat)
                 await self._log_job_finished(
                     task_id=context.message.task_id,
                     task_name=task_name,
@@ -877,6 +999,7 @@ class LineupProvider:
                     finished_at=arc.tz.utcnow(),
                     request_id=request_id,
                     triggered_by=triggered_by,
+                    claim_token=claim.token,
                 )
 
         self._dispatch_tasks[queue] = broker.task(task_name=f"lineup._dispatch.{queue}")(_dispatch)
@@ -1007,6 +1130,16 @@ class LineupProvider:
             except Exception as exc:  # noqa: BLE001 - one bad pass must not kill the loop
                 logger.error(f"lineup durable job reaper pass failed: {exc}")
 
+    def _requeue_grace_seconds(self) -> float:
+        """The `lineup_requeue_grace_seconds` setting, falling back to the
+        default when it is unset or unusable - the reaper must keep working
+        whatever someone typed into settings."""
+        try:
+            value = float(self._kernel.settings.get(REQUEUE_GRACE_KEY))
+        except (TypeError, ValueError, KeyError):
+            return float(_DEFAULT_REQUEUE_GRACE_SECONDS)
+        return value if value >= 0 else float(_DEFAULT_REQUEUE_GRACE_SECONDS)
+
     async def _reap_and_run_stale(self, limit: int = 10) -> int:
         """Claims lineup-owned jobs (`executor='lineup'`) abandoned by a
         dead process — stuck 'Queued' because the kick to Redis/Valkey never
@@ -1018,6 +1151,12 @@ class LineupProvider:
         nothing left to redeliver from Redis/Valkey itself). `FOR UPDATE SKIP
         LOCKED` lets any number of processes with lineup open run this
         concurrently with zero coordination.
+
+        A worker claims its row (with a lease it keeps renewing) before it
+        runs a job (_claim_for_run), so a job that is merely slow is never
+        taken from it: only a "Running" row whose lease lapsed, or a
+        "Queued" row older than `lineup_requeue_grace_seconds`, is
+        abandoned.
 
         Runs the job DIRECTLY off the row's own `payload` — dynamic import,
         same _dispatch_module_allowed() trust boundary as a Redis/Valkey-delivered
@@ -1047,6 +1186,14 @@ class LineupProvider:
         started_at = arc.tz.utcnow()
         lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS, base=started_at)
         claim_token = uuid.uuid4().hex
+        # What counts as abandoned. A job a worker is running holds a lease
+        # that its heartbeat keeps renewing, so a Running row is only taken
+        # once that lease has lapsed. A Queued row is only taken after the
+        # grace period: until then its message may simply be waiting in
+        # Redis for a free worker. A Running row with NO lease comes from a
+        # worker that predates leases; it is taken only after a long time.
+        queued_before = arc.tz.ago(seconds=self._requeue_grace_seconds())
+        legacy_running_before = arc.tz.ago(seconds=_LEGACY_RUNNING_GRACE_SECONDS)
         async with arc.pgdb.acquire() as conn:
             claimed = await conn.fetch(
                 'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
@@ -1054,8 +1201,16 @@ class LineupProvider:
                 "WHERE id IN ("
                 '  SELECT id FROM "_job_log" '
                 "  WHERE executor=$6 AND payload IS NOT NULL "
-                "    AND status IN ('Queued', 'Running') "
-                "    AND (lease_expires_at IS NULL OR lease_expires_at < now()) "
+                "    AND ("
+                "      (status = 'Queued' "
+                "        AND (lease_expires_at IS NULL OR lease_expires_at < now()) "
+                "        AND (queued_at IS NULL OR queued_at < $8)) "
+                "      OR (status = 'Running' "
+                "        AND (lease_expires_at < now() "
+                "          OR (lease_expires_at IS NULL "
+                "              AND (COALESCE(started_at, queued_at) IS NULL "
+                "                   OR COALESCE(started_at, queued_at) < $9))))"
+                "    ) "
                 "  ORDER BY queued_at NULLS FIRST "
                 "  LIMIT $7 "
                 "  FOR UPDATE SKIP LOCKED"
@@ -1067,6 +1222,8 @@ class LineupProvider:
                 claim_token,
                 "lineup",
                 limit,
+                queued_before,
+                legacy_running_before,
             )
 
         async def _run_and_log(row: Any) -> None:
@@ -1182,6 +1339,18 @@ def register(kernel: Any) -> None:
         "of piling up inside the worker and timing out. Raise it for jobs that mostly wait for something else "
         "(web calls, email), and raise the database connections with it.",
     )
+    kernel.settings.declare(
+        REQUEUE_GRACE_KEY,
+        type=int,
+        default=_DEFAULT_REQUEUE_GRACE_SECONDS,
+        doc="How many seconds a background job may wait in the queue before the web servers and workers take it "
+        "over and run it themselves. Normally a worker picks a job up within a moment; this only matters when "
+        "Redis lost the job or every worker is busy. Too low and a job that is merely waiting its turn may be "
+        "run twice; too high and a job lost by Redis waits that long before it runs.",
+    )
+    from .sharing import declare_settings as declare_sharing_settings
+
+    declare_sharing_settings(kernel)  # lineup_share_idle_workers, lineup_strict_queues
     redix = kernel.get("redix")
     provider = LineupProvider(kernel, redis_url=redix.url)
     # pgdb: needed to write into relay's own `_job_log` table (§3.11/

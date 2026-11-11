@@ -44,6 +44,8 @@ from arc.settings import SettingsManager
 # if redix ever renamed it; importing the constant can't.
 from redix import URL_KEY, LockLostError
 
+from .sharing import HomeSlots, IdleBorrower, sharing_enabled, strict_queues
+
 app = typer.Typer(help="Commands for the lineup provider (durable jobs + scheduling).")
 console = Console()
 err_console = Console(stderr=True, style="bold red")
@@ -200,7 +202,11 @@ def job_concurrency_per_queue(n_queues: int, *, configured: int | None, pool_siz
 
 
 async def _resilient_listen(
-    broker, queue_name: str, shutdown_event: asyncio.Event, max_async_tasks: int | None = None
+    broker,
+    queue_name: str,
+    shutdown_event: asyncio.Event,
+    max_async_tasks: int | None = None,
+    slots: HomeSlots | None = None,
 ) -> None:
     """Keeps a queue's Receiver listening indefinitely, surviving a
     transient failure instead of exiting — a worker sitting idle with
@@ -225,6 +231,13 @@ async def _resilient_listen(
     from after being torn down mid-flight."""
     while not shutdown_event.is_set():
         receiver = Receiver(broker=broker, max_async_tasks=max_async_tasks)
+        # `slots` (only when idle workers may help other queues, see lineup.sharing) is told about this
+        # listener's job slots for as long as it listens, so an idle worker can lend them out. Each new
+        # Receiver has a new semaphore, so it is registered again on every restart.
+        sem = getattr(receiver, "sem", None)
+        lend = slots is not None and sem is not None and bool(max_async_tasks)
+        if lend:
+            slots.attach(queue_name, sem, max_async_tasks)
         try:
             await receiver.listen(shutdown_event)
         except asyncio.CancelledError:
@@ -236,6 +249,26 @@ async def _resilient_listen(
                 f"lineup worker: '{queue_name}' listener hiccup ({exc!r}), reconnecting..."
             )
             await asyncio.sleep(1)
+        finally:
+            if lend:
+                slots.detach(queue_name, sem)
+
+
+async def _consume(
+    target: list[str],
+    brokers: dict[str, Any],
+    per_queue: int | None,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """What a worker does until it is told to stop: one listener per home queue, and the borrower
+    that lets an idle worker run jobs of other queues when `lineup_share_idle_workers` is on
+    (lineup.sharing). With that setting off the borrower only checks it once a second."""
+    slots = HomeSlots()
+    borrower = IdleBorrower(home_queues=target, slots=slots, shutdown_event=shutdown_event)
+    await asyncio.gather(
+        *(_resilient_listen(brokers[name], name, shutdown_event, per_queue, slots) for name in target),
+        borrower.run(),
+    )
 
 
 def _resolve_queues(requested: str | None) -> list[str]:
@@ -292,7 +325,10 @@ def worker(
 ) -> None:
     """Consume durable jobs from one or more named queues in this one
     process (a queue is a Redis/Valkey LIST — one Receiver per queue, run
-    concurrently via asyncio.gather, not one process per queue)."""
+    concurrently via asyncio.gather, not one process per queue).
+
+    With the setting `lineup_share_idle_workers` on, a worker that has nothing
+    to do in its own queue also runs jobs of other queues (see lineup/sharing.py)."""
     _boot()
 
     async def _main() -> None:
@@ -338,13 +374,15 @@ def worker(
                 f"[dim]lineup worker: at most {per_queue} job(s) at a time per queue "
                 f"(database pool: {getattr(pgdb, 'max_size', '?')}; set lineup_concurrency to change)[/dim]"
             )
-        try:
-            await asyncio.gather(
-                *(
-                    _resilient_listen(brokers[name], name, shutdown_event, per_queue)
-                    for name in target
-                )
+        if sharing_enabled():
+            strict = strict_queues()
+            console.print(
+                "[dim]lineup worker: idle capacity is shared with other queues (lineup_share_idle_workers is on"
+                + (f"; strict queues: {', '.join(sorted(strict))}" if strict else "")
+                + ")[/dim]"
             )
+        try:
+            await _consume(target, brokers, per_queue, shutdown_event)
         finally:
             console.print("[dim]lineup worker shutting down...[/dim]")
             await arc.events.uninstall_process_bridge()
